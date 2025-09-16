@@ -1,34 +1,8 @@
-# OS/editor
 .DS_Store
 __MACOSX/
-
-# Python
 __pycache__/
 *.pyc
-.venv/
-env/
-venv/
-
-# Ultralytics outputs & caches
 runs/
-*.cache
-*.log
-
-# Data (local only)
 dataset/
 !dataset/README.md
-
-# Reports & demos
-reports/*.csv
-reports/figs/
-demos/*.mp4
-
-# Models/weights (use LFS or keep local)
 *.pt
-models/
-!models/README.md
-
-# Archives
-*.zip
-*.tar
-*.tar.gz
