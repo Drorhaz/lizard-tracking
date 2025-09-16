@@ -1,0 +1,22 @@
+# Pogona Head Detection Dataset Configuration
+# Dataset paths
+path: ../dataset  # dataset root dir
+train: labeled/images/train  # train images (relative to 'path')
+val: labeled/images/val      # val images (relative to 'path')
+
+# Classes
+names:
+  0: pogona_head
+
+# Class count
+nc: 1
+
+# Optional: augmentations
+# augment: True
+# hsv_h: 0.015  # image HSV-Hue augmentation (fraction)
+# hsv_s: 0.7    # image HSV-Saturation augmentation (fraction)
+# hsv_v: 0.4    # image HSV-Value augmentation (fraction)
+# degrees: 0.0  # image rotation (+/- deg)
+# translate: 0.1  # image translation (+/- fraction)
+# scale: 0.5    # image scale (+/- gain)
+# shear: 0.0    # image shear (+/- deg)
