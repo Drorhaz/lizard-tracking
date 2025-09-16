@@ -63,7 +63,7 @@ python train_full.py --device 0 --epochs 60 --batch auto
 This will create a `runs/detect/...` folder with `weights/best.pt` and training plots.
 
 ### 4) Inference & FPS check
-(Optional) After training, run inference + latency profiling:
+After training, run inference + latency profiling:
 ```bash
 python tools/bench_infer.py --weights runs/detect/<RUN>/weights/best.pt --images dataset/images/val
 ```
