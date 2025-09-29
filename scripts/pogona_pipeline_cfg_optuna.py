@@ -215,6 +215,13 @@ def main() -> None:
     _train_once(train_cfg)
 
     best_pt = run_dir / "weights" / "best.pt"
+    # best pt can be found in all run_dir + * folders
+    for folder in run_dir.glob("*"):
+        candidate = folder / "weights" / "best.pt"
+        if candidate.exists():
+            best_pt = candidate
+            break
+    
     if best_pt.exists():
         results = _validate(str(best_pt), cfg["DATA_YAML"])
         score = _score_from_results(results, run_dir)

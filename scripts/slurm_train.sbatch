@@ -35,7 +35,7 @@ echo "[INFO] JOB_ID: ${SLURM_JOB_ID}"
 #------------------------------------ run script ------------------------------------#
 
 
-PATH_TO_SCRIPT="$BASE_PATH/scripts/pogona_pipeline_cfg_optuna.py"
+PATH_TO_SCRIPT="$BASE_PATH/scripts/pogona_pipeline_cfg.py" #pogona_pipeline_cfg_optuna
 echo "[INFO] running script: $PATH_TO_SCRIPT"
 
 python "$PATH_TO_SCRIPT"

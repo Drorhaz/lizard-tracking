@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
-"""CLI wrapper around the PoseTrainer with sane defaults.
-
-This replaces the loose training script with something that can be shared by
-Optuna sweeps, SLURM jobs, and local experimentation.
-"""
+"""Train the pogona head pose model using a simple config block."""
 from __future__ import annotations
 
-import argparse
-import json
-from pathlib import Path
-
+import shutil
 from pathlib import Path
 import sys
 
@@ -21,64 +14,62 @@ if str(SRC_DIR) not in sys.path:
 from lizard_tracking.config import PoseTrainingConfig
 from lizard_tracking.pipelines import PoseTrainer
 
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the pogona head pose model")
-    parser.add_argument("--data", default="data/pogona_head_pose.yaml", help="YAML describing the dataset")
-    parser.add_argument("--model", default="yolo11s-pose.pt", help="Base checkpoint to fine-tune")
-    parser.add_argument("--epochs", type=int, default=150)
-    parser.add_argument("--imgsz", type=int, default=640)
-    parser.add_argument("--batch", type=int, default=16)
-    parser.add_argument("--device", default="0")
-    parser.add_argument("--lr0", type=float, default=0.01)
-    parser.add_argument("--weight-decay", type=float, default=5e-4)
-    parser.add_argument("--patience", type=int, default=None)
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--project", default="runs/pose")
-    parser.add_argument("--run-name", default="pogona_head_pose")
-    parser.add_argument("--extra", type=str, help="JSON dict of additional Ultralytics overrides")
-    return parser.parse_args()
+# ---------------------------------------------------------------------------
+# Adjust these values instead of passing CLI arguments.
+# ---------------------------------------------------------------------------
+CONFIG = {
+    "data_yaml": "data/pogona_head_pose.yaml",
+    "model": "yolo11s-pose.pt",
+    "epochs": 150,
+    "imgsz": 640,
+    "batch": 16,
+    "device": 0,
+    "lr0": 0.01,
+    "weight_decay": 5e-4,
+    "patience": None,
+    "resume": False,
+    "project": "runs/pose",
+    "run_name": "pogona_head_pose",
+    "extra_overrides": {},  # additional Ultralytics overrides
+    "export_best_to": "output/models/head_pose/best.pt",
+    "skip_training": True,
+}
 
 
 def main() -> None:
-    args = parse_args()
-    extra_overrides = json.loads(args.extra) if args.extra else {}
-
-    cfg = PoseTrainingConfig(
-        data_yaml=args.data,
-        model=args.model,
-        epochs=args.epochs,
-        imgsz=args.imgsz,
-        batch=args.batch,
-        device=args.device,
-        lr0=args.lr0,
-        weight_decay=args.weight_decay,
-        patience=args.patience,
-        resume=args.resume,
-        project=args.project,
-        run_name=args.run_name,
-        extra_overrides=extra_overrides,
-    )
+    config = CONFIG.copy()
+    export_path = config.pop("export_best_to", None)
+    skip_training = bool(config.pop("skip_training", False))
+    cfg = PoseTrainingConfig(**config)
 
     trainer = PoseTrainer(cfg)
     print(f"[TRAIN] {cfg.model} → {cfg.run_directory}")
-    results = trainer.train()
-    try:
+
+    if not skip_training:
+        results = trainer.train()
         metrics = getattr(results, "results_dict", None)
         if metrics:
-            print("[RESULTS]", json.dumps(metrics, indent=2))
-    except Exception:  # pragma: no cover - logging only
-        pass
+            print("[RESULTS]", metrics)
+    else:
+        print("[INFO] skip_training=True; training phase skipped")
 
     weights = None
     try:
         weights = trainer.best_checkpoint()
         print(f"[VAL] Using {weights}")
     except FileNotFoundError:
-        print("[VAL] best.pt not found; skipping validation")
+        print("[WARN] best.pt not found; skipping validation")
 
-    if weights is not None and Path(weights).exists():
+    if weights and Path(weights).exists():
         trainer.validate(str(weights))
+        print(f"[INFO] Artifacts saved under {cfg.run_directory.resolve()}")
+        if export_path:
+            export_path = Path(export_path)
+            export_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(weights, export_path)
+            print(f"[EXPORT] Copied best checkpoint to {export_path.resolve()}")
+    else:
+        print("[WARN] No checkpoint available to export")
 
 
 if __name__ == "__main__":
