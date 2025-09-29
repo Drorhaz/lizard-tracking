@@ -7,10 +7,10 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G   
-#SBATCH --time=12:00:00
-#SBATCH --output=/scratch200/bareketd1/logs/ph/%x-%j.out
-#SBATCH --error=/scratch200/bareketd1/logs/ph/%x-%j.err
+#SBATCH --mem=32G   
+#SBATCH --time=8:00:00
+#SBATCH --output=/scratch200/bareketd1/logs/ph/compare/%x-%j.out
+#SBATCH --error=/scratch200/bareketd1/logs/ph/compare/%x-%j.err
 
 
 
@@ -36,10 +36,28 @@ echo "[INFO] JOB_ID: ${SLURM_JOB_ID}"
 #------------------------------------ run script ------------------------------------#
 
 
-PATH_TO_SCRIPT="$BASE_PATH/scripts/pogona_pipeline_cfg.py" #pogona_pipeline_cfg_optuna
+PATH_TO_SCRIPT="$BASE_PATH/scripts/compare_runs_full.py" 
 echo "[INFO] running script: $PATH_TO_SCRIPT"
 
-python "$PATH_TO_SCRIPT"
+
+# --- make sure CUDA is visible to the job ---
+unset CUDA_VISIBLE_DEVICES                       # remove any "cpu-only" setting
+# Prefer SLURM-provided variables, which list the allocated GPU ids
+if [[ -n "$SLURM_JOB_GPUS" ]]; then
+  export CUDA_VISIBLE_DEVICES="$SLURM_JOB_GPUS"
+elif [[ -n "$SLURM_STEP_GPUS" ]]; then
+  export CUDA_VISIBLE_DEVICES="$SLURM_STEP_GPUS"
+fi
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+
+# (optional, but often required on clusters)
+module -q load CUDA || true
+
+echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+nvidia-smi | head -n 20 || true
+
+
+srun --gres=gpu:1 --export=ALL python "$PATH_TO_SCRIPT"
 
 #------------------------------------ log info ------------------------------------#
 echo "[INFO] job finished"
