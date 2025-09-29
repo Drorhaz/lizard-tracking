@@ -1,0 +1,10 @@
+path: ../dataset
+train: images/train
+val: images/val
+
+names:
+  0: pogona_head
+
+kpt_shape: [3, 3]
+kpt_label: [nose, ear_left, ear_right]
+flip_idx: [0, 2, 1]
