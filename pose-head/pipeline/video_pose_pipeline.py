@@ -42,27 +42,28 @@ except ImportError:
 
 # Web interface (optional)
 _web = None
+
 def _maybe_start_web(cfg):
     global _web
     if _web is not None:
         return _web
     if cfg.get('WEB_PREVIEW', False):
         try:
-            # Connect to shared web interface
+            # Connect to shared web interface (local mode only)
             from pipeline.shared_web_interface import update_web_frame
             _web = update_web_frame  # Use the update function directly
             print('[WEB] Connected to shared web interface')
             return _web
         except Exception as e:
             print(f'[WEB][WARN] Could not connect to shared web interface: {e}')
-            # Fallback: don't use web interface
+            # Note: HPC mode streams via saved labeled frames, not real-time
             _web = None
     return _web
 
 def _web_update(frame):
     if _web is not None:
         try:
-            _web(frame)  # Call the update function directly
+            _web(frame)  # Call the update function directly (local mode only)
         except Exception as e:
             print(f'[WEB][WARN] Error updating web frame: {e}')
 
@@ -101,6 +102,17 @@ def _get_float(name: str, default: float) -> float:
         return float(v) if v != "" else default
     except Exception:
         return default
+    
+def _get_path(name: str, default: str) -> Path:
+    v = os.getenv(name, "")
+    if v != "":
+        # Expand environment variables like $USER
+        expanded = os.path.expandvars(v)
+        return Path(expanded)
+    else:
+        # Also expand environment variables in default
+        expanded_default = os.path.expandvars(default)
+        return Path(expanded_default)
 
 # ──────────────────────────────
 # progress helpers
@@ -229,20 +241,27 @@ def draw_overlay(frame: np.ndarray, pose: Optional[HeadPose]) -> np.ndarray:
         return overlay
     x1,y1,x2,y2 = map(int, pose.bbox_xyxy)
     cv2.rectangle(overlay, (x1,y1), (x2,y2), (0,255,0), 2)
+    
+    # Draw nose (red circle)
     if pose.nose:
         nose = (int(pose.nose[0]), int(pose.nose[1]))
-        cv2.circle(overlay, nose, 4, (0,0,255), -1)
+        cv2.circle(overlay, nose, 6, (0,0,255), -1)  # Red circle for nose
+    
+    # Draw ears (blue circles) and connection line
     if pose.ear_left and pose.ear_right and pose.nose:
         left = (int(pose.ear_left[0]), int(pose.ear_left[1]))
         right = (int(pose.ear_right[0]), int(pose.ear_right[1]))
         mid = ((left[0]+right[0])//2, (left[1]+right[1])//2)
-        cv2.circle(overlay, left, 4, (255,0,0), -1)
-        cv2.circle(overlay, right,4, (255,0,0), -1)
-        cv2.line(overlay, nose, mid, (0,255,255), 2)
-    # conf text
-    txt = f"{pose.conf:.2f}"
-    cv2.putText(overlay, txt, (x1, max(12,y1-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 2, cv2.LINE_AA)
-    cv2.putText(overlay, txt, (x1, max(12,y1-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1, cv2.LINE_AA)
+        
+        # Draw ear circles
+        cv2.circle(overlay, left, 5, (255,0,0), -1)  # Blue circle for left ear
+        cv2.circle(overlay, right, 5, (255,0,0), -1)  # Blue circle for right ear
+        cv2.line(overlay, (int(pose.nose[0]), int(pose.nose[1])), mid, (0,255,255), 2)  # Yellow line
+    
+    # Only show head confidence text on bounding box
+    bbox_txt = f"HEAD {pose.conf:.3f}"
+    cv2.putText(overlay, bbox_txt, (x1, max(15,y1-8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
+    cv2.putText(overlay, bbox_txt, (x1, max(15,y1-8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 1, cv2.LINE_AA)
     return overlay
 
 def save_yolo_label_txt(path_txt: Path, cls_id: int, bbox_xyxy: Tuple[float,float,float,float], img_w: int, img_h: int, conf: Optional[float] = None):
@@ -465,16 +484,16 @@ def run_playback_from_cache(run_dir: Path, cfg: dict):
 def main():
     # read env config
     MODE = _get_env("MODE", "INFER_LIVE").upper()
-    VIDEO_PATH = _get_env("VIDEO_PATH", "")
+    VIDEO_PATH = _get_env("VIDEO_PATH", None)
     if not VIDEO_PATH:
         raise SystemExit("Set VIDEO_PATH in config/.env")
 
     cfg = dict(
         MODE=MODE,
-        VIDEO_PATH=VIDEO_PATH,
-        MODEL_PATH=_get_env("MODEL_PATH",""),
-        MODEL_DIR=_get_env("MODEL_DIR","output/models/head_pose"),
-        OUTPUT_DIR=_get_env("OUTPUT_DIR","output/detections"),
+        VIDEO_PATH=_get_env("VIDEO_PATH", ""),
+        MODEL_PATH=_get_env("MODEL_PATH", ""),
+        MODEL_DIR=_get_env("MODEL_DIR", "output/models/head_pose"),
+        OUTPUT_DIR=_get_env("OUTPUT_DIR", "output/detections"),
         PROCESS_EVERY_N=_get_int("PROCESS_EVERY_N", 1),
         LABEL_EVERY_N=_get_int("LABEL_EVERY_N", 10),
         PREVIEW=_get_bool("PREVIEW", True) if MODE=="INFER_LIVE" else False,  # force no window in LABELS_ONLY/PLAYBACK unless you flip it on purpose

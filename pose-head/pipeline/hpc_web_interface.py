@@ -9,360 +9,8 @@ from typing import Optional, Dict, Any
 from pathlib import Path
 from datetime import datetime
 import cv2, numpy as np
-from flask import Flask, Response, render_template_string, request, jsonify
+from flask import Flask, Response, render_template, request, jsonify
 from pipeline.shared_web_interface import SharedWebInterface
-
-# HTML Template with Play Button and Controls
-HTML_TEMPLATE = """
-<!doctype html>
-<html>
-<head>
-    <meta charset='utf-8'>
-    <title>HPC Pose Pipeline</title>
-    <style>
-        body { 
-            background: #1a1a1a; 
-            margin: 0; 
-            font-family: Arial, sans-serif; 
-            color: #fff;
-        }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-        .header {
-            text-align: center;
-            margin-bottom: 30px;
-        }
-        .controls {
-            background: #2a2a2a;
-            padding: 20px;
-            border-radius: 10px;
-            margin-bottom: 20px;
-        }
-        .video-container {
-            text-align: center;
-            background: #000;
-            border-radius: 10px;
-            padding: 10px;
-            margin-bottom: 20px;
-        }
-        .video-stream {
-            max-width: 95vw;
-            max-height: 60vh;
-            border-radius: 8px;
-        }
-        .status {
-            background: #333;
-            padding: 15px;
-            border-radius: 10px;
-            margin-bottom: 20px;
-        }
-        .btn {
-            background: #4CAF50;
-            color: white;
-            padding: 12px 24px;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            font-size: 16px;
-            margin: 5px;
-        }
-        .btn:hover { background: #45a049; }
-        .btn:disabled { background: #666; cursor: not-allowed; }
-        .btn-stop { background: #f44336; }
-        .btn-stop:hover { background: #da190b; }
-        .form-group {
-            margin: 10px 0;
-        }
-        .form-group label {
-            display: inline-block;
-            width: 150px;
-            margin-right: 10px;
-        }
-        .form-group input, .form-group select {
-            padding: 8px;
-            border: 1px solid #555;
-            border-radius: 4px;
-            background: #444;
-            color: #fff;
-            width: 200px;
-        }
-        .progress-bar {
-            width: 100%;
-            height: 20px;
-            background: #444;
-            border-radius: 10px;
-            overflow: hidden;
-            margin: 10px 0;
-        }
-        .progress-fill {
-            height: 100%;
-            background: linear-gradient(90deg, #4CAF50, #45a049);
-            width: 0%;
-            transition: width 0.3s ease;
-        }
-        .stats {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 15px;
-            margin: 20px 0;
-        }
-        .stat-card {
-            background: #2a2a2a;
-            padding: 15px;
-            border-radius: 8px;
-            text-align: center;
-        }
-        .stat-value {
-            font-size: 24px;
-            font-weight: bold;
-            color: #4CAF50;
-        }
-        .stat-label {
-            font-size: 14px;
-            color: #aaa;
-        }
-        .log {
-            background: #000;
-            color: #0f0;
-            padding: 15px;
-            border-radius: 8px;
-            height: 200px;
-            overflow-y: auto;
-            font-family: monospace;
-            font-size: 12px;
-        }
-        .hidden { display: none; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>🦎 HPC Pose Pipeline</h1>
-            <p>Real-time lizard pose estimation on GPU cluster</p>
-        </div>
-
-        <div class="controls">
-            <h3>Pipeline Controls</h3>
-            <div class="form-group">
-                <label>Video File:</label>
-                <select id="videoSelect">
-                    <option value="">Select video...</option>
-                </select>
-            </div>
-            <div class="form-group">
-                <label>Execution Mode:</label>
-                <select id="executionMode" onchange="toggleExecutionOptions()">
-                    <option value="local">Local (CPU)</option>
-                    <option value="hpc">HPC Cluster (GPU)</option>
-                </select>
-            </div>
-
-            <div class="form-group" id="timeLimitGroup" style="display:none;">
-                <label>Time Limit:</label>
-                <input type="text" id="timeLimit" value="02:00:00" placeholder="HH:MM:SS">
-            </div>
-            <div class="form-group">
-                <label>Confidence Threshold:</label>
-                <input type="number" id="confThresh" value="0.25" min="0.1" max="1.0" step="0.05">
-            </div>
-            <div class="form-group">
-                <label>Image Size:</label>
-                <input type="number" id="imgSize" value="960" min="320" max="1920" step="32">
-            </div>
-            
-            <div style="margin-top: 20px;">
-                <button class="btn" id="playBtn" onclick="startPipeline()">
-                    ▶️ Start Pipeline
-                </button>
-                <button class="btn btn-stop hidden" id="stopBtn" onclick="stopPipeline()">
-                    ⏹️ Stop Pipeline
-                </button>
-            </div>
-        </div>
-
-        <div class="status">
-            <h3>Pipeline Status</h3>
-            <div id="statusText">Ready to start</div>
-            <div class="progress-bar">
-                <div class="progress-fill" id="progressFill"></div>
-            </div>
-            <div id="progressText">0% complete</div>
-        </div>
-
-        <div class="stats">
-            <div class="stat-card">
-                <div class="stat-value" id="fpsValue">0.0</div>
-                <div class="stat-label">FPS</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value" id="detectionRate">0.0%</div>
-                <div class="stat-label">Detection Rate</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value" id="processedFrames">0</div>
-                <div class="stat-label">Processed Frames</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value" id="jobId">-</div>
-                <div class="stat-label">SLURM Job ID</div>
-            </div>
-        </div>
-
-        <div class="video-container">
-            <h3>Live Pose Detection</h3>
-            <img src="/video" class="video-stream" alt="Waiting for video stream...">
-        </div>
-
-        <div class="status">
-            <h3>Pipeline Log</h3>
-            <div class="log" id="logOutput">Waiting for pipeline to start...\n</div>
-        </div>
-    </div>
-
-    <script>
-        let jobId = null;
-        let statusInterval = null;
-
-        // Toggle execution mode options
-        function toggleExecutionOptions() {
-            const mode = document.getElementById('executionMode').value;
-            const timeLimitGroup = document.getElementById('timeLimitGroup');
-            const playBtn = document.getElementById('playBtn');
-            
-            if (mode === 'hpc') {
-                timeLimitGroup.style.display = 'block';
-                playBtn.innerHTML = '▶️ Start GPU Pipeline';
-            } else {
-                timeLimitGroup.style.display = 'none';
-                playBtn.innerHTML = '▶️ Start Local Pipeline';
-            }
-        }
-
-        // Load available videos on page load
-        fetch('/api/videos')
-            .then(r => r.json())
-            .then(videos => {
-                const select = document.getElementById('videoSelect');
-                videos.forEach(video => {
-                    const option = document.createElement('option');
-                    option.value = video.path;
-                    option.textContent = video.name;
-                    select.appendChild(option);
-                });
-            });
-
-        function startPipeline() {
-            const executionMode = document.getElementById('executionMode').value;
-            const config = {
-                execution_mode: executionMode,
-                video_path: document.getElementById('videoSelect').value,
-                partition: 'gpu',  // Always use gpu partition
-                time_limit: executionMode === 'hpc' ? document.getElementById('timeLimit').value : null,
-                conf_thresh: parseFloat(document.getElementById('confThresh').value),
-                img_size: parseInt(document.getElementById('imgSize').value)
-            };
-
-            if (!config.video_path) {
-                alert('Please select a video file');
-                return;
-            }
-
-            fetch('/api/start', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(config)
-            })
-            .then(r => r.json())
-            .then(data => {
-                if (data.success) {
-                    jobId = data.job_id;
-                    document.getElementById('jobId').textContent = jobId;
-                    document.getElementById('playBtn').classList.add('hidden');
-                    document.getElementById('stopBtn').classList.remove('hidden');
-                    
-                    if (data.immediate_start) {
-                        // CPU mode: start video immediately
-                        document.getElementById('statusText').textContent = 'Pipeline running locally - streaming video...';
-                        startStatusUpdates();
-                    } else {
-                        // GPU mode: wait for job to start
-                        document.getElementById('statusText').textContent = 'Job submitted to GPU cluster - waiting for start...';
-                        startStatusUpdates();
-                    }
-                } else {
-                    alert('Failed to start pipeline: ' + data.error);
-                }
-            });
-        }
-
-        function stopPipeline() {
-            if (!jobId) return;
-            
-            fetch('/api/stop', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({job_id: jobId})
-            })
-            .then(r => r.json())
-            .then(data => {
-                document.getElementById('playBtn').classList.remove('hidden');
-                document.getElementById('stopBtn').classList.add('hidden');
-                document.getElementById('statusText').textContent = 'Pipeline stopped';
-                stopStatusUpdates();
-            });
-        }
-
-        function startStatusUpdates() {
-            statusInterval = setInterval(updateStatus, 1000);
-        }
-
-        function stopStatusUpdates() {
-            if (statusInterval) {
-                clearInterval(statusInterval);
-                statusInterval = null;
-            }
-        }
-
-        function updateStatus() {
-            if (!jobId) return;
-
-            fetch('/api/status/' + jobId)
-                .then(r => r.json())
-                .then(data => {
-                    document.getElementById('statusText').textContent = data.status;
-                    document.getElementById('fpsValue').textContent = data.fps.toFixed(1);
-                    document.getElementById('detectionRate').textContent = data.detection_rate.toFixed(1) + '%';
-                    document.getElementById('processedFrames').textContent = data.processed_frames;
-                    
-                    if (data.progress !== undefined) {
-                        document.getElementById('progressFill').style.width = data.progress + '%';
-                        document.getElementById('progressText').textContent = data.progress.toFixed(1) + '% complete';
-                    }
-
-                    // Update log
-                    if (data.log_lines) {
-                        const logDiv = document.getElementById('logOutput');
-                        data.log_lines.forEach(line => {
-                            logDiv.innerHTML += line + '\\n';
-                        });
-                        logDiv.scrollTop = logDiv.scrollHeight;
-                    }
-
-                    // Check if job is finished
-                    if (data.status.includes('Completed') || data.status.includes('Failed')) {
-                        stopStatusUpdates();
-                        document.getElementById('playBtn').classList.remove('hidden');
-                        document.getElementById('stopBtn').classList.add('hidden');
-                    }
-                });
-        }
-    </script>
-</body>
-</html>
-"""
 
 class HPCWebInterface:
     """Web interface for submitting and monitoring HPC GPU jobs"""
@@ -372,10 +20,14 @@ class HPCWebInterface:
     def __init__(self, host='0.0.0.0', port=8765):
         self.host = host
         self.port = port
-        self.app = Flask(__name__)
+        # Configure Flask app with proper template and static directories
+        self.app = Flask(__name__, 
+                        template_folder='templates',
+                        static_folder='static')
         self._lock = threading.Lock()
         self._th = None
         self.jobs: Dict[str, Dict[str, Any]] = {}
+        self._stop_flags: Dict[str, threading.Event] = {}  # Stop flags for jobs
         
         # Use shared web interface for video streaming
         self.shared_web = SharedWebInterface.get_instance()
@@ -388,7 +40,7 @@ class HPCWebInterface:
     def setup_routes(self):
         @self.app.route('/')
         def index():
-            return render_template_string(HTML_TEMPLATE)
+            return render_template('index.html')
             
         @self.app.route('/video')
         def video():
@@ -422,13 +74,35 @@ class HPCWebInterface:
         @self.app.route('/api/stop', methods=['POST'])
         def stop_pipeline():
             job_id = request.json.get('job_id')
-            success = self._cancel_job(job_id)
+            success = self._stop_pipeline(job_id)
             return jsonify({'success': success})
             
         @self.app.route('/api/status/<job_id>')
         def get_status(job_id):
             status = self._get_job_status(job_id)
             return jsonify(status)
+            
+        @self.app.route('/api/completed_runs')
+        def list_completed_runs():
+            """List available completed runs with labeled frames"""
+            runs = []
+            output_base = Path("/a/home/cc/students/neurosci/bareketd1/sandbox/lizard-tracking/output/detections")
+            if output_base.exists():
+                run_dirs = sorted([d for d in output_base.iterdir() if d.is_dir()], 
+                                key=lambda x: x.stat().st_mtime, reverse=True)
+                
+                for run_dir in run_dirs[:10]:  # Show last 10 runs
+                    labeled_frames_dir = run_dir / "labeled_frames"
+                    if labeled_frames_dir.exists():
+                        frame_files = list(labeled_frames_dir.glob("frame*.jpg"))
+                        if frame_files:
+                            runs.append({
+                                'name': run_dir.name,
+                                'path': str(run_dir),
+                                'frame_count': len(frame_files),
+                                'created': run_dir.stat().st_mtime
+                            })
+            return jsonify(runs)
     
     def _get_available_videos(self):
         """Scan for available video files"""
@@ -459,8 +133,11 @@ class HPCWebInterface:
             # Import required modules for pose detection
             import sys
             sys.path.append('/a/home/cc/students/neurosci/bareketd1/sandbox/lizard-tracking/pose-head')
-            from src.lizard_tracking.models import YOLOPoseModel
-            from src.draw import draw_overlay
+            from pipeline.video_pose_pipeline import YOLOPoseModel, draw_overlay
+            
+            # Create stop flag for this job
+            stop_flag = threading.Event()
+            self._stop_flags['local'] = stop_flag
             
             def run_local_inference():
                 """Run local inference with real-time streaming"""
@@ -475,11 +152,12 @@ class HPCWebInterface:
                     
                     # Get video properties
                     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    fps = cap.get(cv2.CAP_PROP_FPS)
-                    print(f"📹 Video: {total_frames} frames @ {fps:.1f} FPS")
+                    video_fps = cap.get(cv2.CAP_PROP_FPS)
+                    fps = 30.0  # Force 30 FPS as requested
+                    print(f"📹 Video: {total_frames} frames @ {video_fps:.1f} FPS (playing at {fps:.1f} FPS)")
                     
                     # Initialize YOLO model
-                    model_dir = Path("output/models/head_pose")
+                    model_dir = Path("../output/models/head_pose")
                     model_paths = list(model_dir.glob("**/best*.pt")) + list(model_dir.glob("**/*.pt"))
                     if not model_paths:
                         print(f"❌ No model found in {model_dir}")
@@ -499,7 +177,7 @@ class HPCWebInterface:
                     detections = 0
                     
                     # Process video frames
-                    while True:
+                    while not stop_flag.is_set():
                         ret, frame = cap.read()
                         if not ret:
                             print("📹 End of video reached")
@@ -508,61 +186,75 @@ class HPCWebInterface:
                         frame_count += 1
                         
                         # Run inference
-                        results = model.predict(frame)
+                        poses = model.predict(frame)
                         
-                        # Find best detection
-                        best_detection = None
-                        best_conf = 0
-                        
-                        if results and len(results) > 0:
-                            for result in results:
-                                if hasattr(result, 'keypoints') and result.keypoints is not None:
-                                    kpts = result.keypoints.data  # Shape: [N, num_keypoints, 3]
-                                    boxes = result.boxes.data if result.boxes is not None else None
-                                    
-                                    if kpts.shape[0] > 0 and boxes is not None:
-                                        # Get confidence from bounding box
-                                        conf = float(boxes[0, 4])  # confidence score
-                                        if conf > best_conf:
-                                            best_conf = conf
-                                            best_detection = {
-                                                'bbox': boxes[0, :4].cpu().numpy(),  # x1, y1, x2, y2
-                                                'conf': conf,
-                                                'keypoints': kpts[0].cpu().numpy()  # [num_keypoints, 3]
-                                            }
+                        # Find best pose with more lenient criteria
+                        best_pose = None
+                        if poses:
+                            # Debug: show all pose confidences
+                            if frame_count % 50 == 0:
+                                conf_list = [f"{p.conf:.3f}" for p in poses]
+                                print(f"🔍 Frame {frame_count}: Found {len(poses)} poses with confidences: {conf_list}")
+                            
+                            # Accept any pose above a lower threshold
+                            valid_poses = [p for p in poses if p.conf > 0.1]  # Even lower threshold
+                            if valid_poses:
+                                best_pose = max(valid_poses, key=lambda p: p.conf)
+                                
+                                # Additional debug for good detections
+                                if frame_count % 100 == 0:
+                                    print(f"✅ Frame {frame_count}: Best pose conf: {best_pose.conf:.3f}, threshold: {config['conf_thresh']}")
                         
                         # Draw overlay on frame
-                        if best_detection:
+                        if best_pose:
                             detections += 1
-                            frame_with_overlay = draw_overlay(frame, best_detection)
+                            frame_with_overlay = draw_overlay(frame, best_pose)
                         else:
                             frame_with_overlay = frame.copy()
+                            # Debug info for no detections
+                            if frame_count % 100 == 0:
+                                print(f"⚠️ Frame {frame_count}: No poses detected above 0.1 confidence")
                         
                         # Update web stream with processed frame
                         self.shared_web.update(frame_with_overlay)
                         
-                        # Update job statistics
-                        if 'local' in self.jobs:
-                            job = self.jobs['local']
-                            job['processed_frames'] = frame_count
-                            job['fps'] = fps
-                            job['detection_rate'] = (detections / frame_count) * 100
-                            job['progress'] = (frame_count / total_frames) * 100
+                        # Update job statistics WITH thread safety
+                        with self._lock:
+                            if 'local' in self.jobs:
+                                job = self.jobs['local']
+                                job['processed_frames'] = frame_count
+                                job['fps'] = fps
+                                job['detection_rate'] = (detections / frame_count) * 100 if frame_count > 0 else 0
+                                job['progress'] = (frame_count / total_frames) * 100 if total_frames > 0 else 0
+                                job['total_detections'] = detections
+                                
+                                # Debug print every 50 frames
+                                if frame_count % 50 == 0:
+                                    print(f"📊 Stats: {frame_count}/{total_frames} frames, {detections} detections ({job['detection_rate']:.1f}%)")
                         
                         # Small delay to control playback speed
                         time.sleep(1.0 / fps if fps > 0 else 0.033)  # Match video FPS
                     
                     cap.release()
-                    print(f"✅ Local inference completed: {frame_count} frames, {detections} detections")
+                    
+                    if stop_flag.is_set():
+                        print(f"🛑 Local inference stopped by user: {frame_count} frames, {detections} detections")
+                    else:
+                        print(f"✅ Local inference completed: {frame_count} frames, {detections} detections")
                     
                     # Mark job as completed
-                    if 'local' in self.jobs:
-                        self.jobs['local']['status'] = 'Completed successfully'
+                    with self._lock:
+                        if 'local' in self.jobs:
+                            if stop_flag.is_set():
+                                self.jobs['local']['status'] = 'Stopped by user'
+                            else:
+                                self.jobs['local']['status'] = 'Completed successfully'
                     
                 except Exception as e:
                     print(f"❌ Error in local inference: {e}")
-                    if 'local' in self.jobs:
-                        self.jobs['local']['status'] = f'Failed: {str(e)}'
+                    with self._lock:
+                        if 'local' in self.jobs:
+                            self.jobs['local']['status'] = f'Failed: {str(e)}'
             
             # Start inference in background thread
             inference_thread = threading.Thread(target=run_local_inference, daemon=True)
@@ -577,6 +269,7 @@ class HPCWebInterface:
                 'fps': 0.0,
                 'detection_rate': 0.0,
                 'processed_frames': 0,
+                'total_detections': 0,
                 'log_lines': [],
                 'start_time': time.time(),
                 'execution_mode': 'local'
@@ -589,83 +282,117 @@ class HPCWebInterface:
             return False
     
     def _submit_hpc_job(self, config):
-        """Submit SLURM job to GPU partition"""
-        job_id = str(uuid.uuid4())[:8]
-        
-        # Create SLURM script
-        slurm_script = self._create_slurm_script(config, job_id)
-        script_path = Path(f"/tmp/pose_job_{job_id}.sbatch")
-        
-        with open(script_path, 'w') as f:
-            f.write(slurm_script)
-        
+        """Submit SLURM job using existing working submit_labels_gpu.sh script"""
         try:
-            # Submit job
-            result = subprocess.run(['sbatch', str(script_path)], 
-                                  capture_output=True, text=True)
+            # Set environment variables for the job
+            env = os.environ.copy()
+            env.update({
+                'VIDEO_PATH': config['video_path'],
+                'MODE': 'INFER_LIVE',  # Use INFER_LIVE for streaming support
+                'CONF_THRESH': str(config['conf_thresh']),
+                'IMG_SIZE': str(config['img_size']),
+                'WEB_PREVIEW': 'true',  # Enable web streaming
+                'WEB_HOST': '0.0.0.0',
+                'WEB_PORT': '8765',
+                'PREVIEW': 'false',  # Disable local preview
+                'HPC_MODE': 'true',   # Signal that we're running on HPC
+                'FPS_LIMIT': '30'     # Force 30 FPS
+            })
+            
+            # Change to the correct directory and run the existing script
+            script_path = Path("../hpc/submit_labels_gpu.sh").resolve()
+            if not script_path.exists():
+                script_path = Path("hpc/submit_labels_gpu.sh").resolve()
+            
+            if not script_path.exists():
+                print(f"❌ Could not find submit_labels_gpu.sh script")
+                return None
+            
+            print(f"🚀 Using existing SLURM script: {script_path}")
+            
+            # Submit job using the existing working script
+            result = subprocess.run(['bash', str(script_path)], 
+                                  capture_output=True, text=True, env=env,
+                                  cwd=script_path.parent.parent)  # Run from pose-head directory
             
             if result.returncode == 0:
-                # Extract SLURM job ID from output
-                slurm_job_id = result.stdout.strip().split()[-1]
+                # Extract SLURM job ID from output - look for "Submitted batch job XXXXX"
+                output_lines = result.stdout.strip().split('\n')
+                slurm_job_id = None
                 
-                self.jobs[job_id] = {
-                    'slurm_id': slurm_job_id,
-                    'config': config,
-                    'status': 'Submitted to SLURM',
-                    'progress': 0.0,
-                    'fps': 0.0,
-                    'detection_rate': 0.0,
-                    'processed_frames': 0,
-                    'log_lines': [],
-                    'start_time': time.time(),
-                    'execution_mode': 'hpc'
-                }
+                for line in output_lines:
+                    if 'Submitted batch job' in line:
+                        slurm_job_id = line.split()[-1]
+                        break
                 
-                return job_id
+                if slurm_job_id:
+                    print(f"✅ SLURM job submitted: {slurm_job_id}")
+                    
+                    # Use the SLURM job ID as our job ID (not UUID)
+                    job_id = slurm_job_id
+                    
+                    self.jobs[job_id] = {
+                        'slurm_id': slurm_job_id,
+                        'config': config,
+                        'status': 'Submitted to SLURM',
+                        'progress': 0.0,
+                        'fps': 30.0,  # Set expected FPS
+                        'detection_rate': 0.0,
+                        'processed_frames': 0,
+                        'total_detections': 0,
+                        'log_lines': [],
+                        'start_time': time.time(),
+                        'execution_mode': 'hpc',
+                        'stream_delay': 10  # 10 second buffer for processing
+                    }
+                    
+                    # Start a delayed video stream checker
+                    self._start_hpc_stream_monitor(job_id, slurm_job_id)
+                    
+                    return job_id
+                else:
+                    print(f"❌ Could not extract SLURM job ID from output: {result.stdout}")
+                    return None
             else:
-                print(f"Failed to submit job: {result.stderr}")
+                print(f"❌ Failed to submit job: {result.stderr}")
+                print(f"❌ stdout: {result.stdout}")
                 return None
                 
         except Exception as e:
-            print(f"Error submitting job: {e}")
+            print(f"❌ Error submitting job: {e}")
             return None
     
-    def _create_slurm_script(self, config, job_id):
-        """Generate SLURM batch script for GPU job"""
-        return f"""#!/bin/bash
-#SBATCH --job-name=pose_pipeline_{job_id}
-#SBATCH --partition={config['partition']}
-#SBATCH --time={config['time_limit']}
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
-#SBATCH --output=/tmp/pose_job_{job_id}.out
-#SBATCH --error=/tmp/pose_job_{job_id}.err
-
-# Load environment
-source /scratch200/bareketd1/LizardPose/bin/activate
-
-# Set environment variables
-export VIDEO_PATH="{config['video_path']}"
-export MODE="LABELS_ONLY"
-export CONF_THRESH="{config['conf_thresh']}"
-export IMG_SIZE="{config['img_size']}"
-export OUTPUT_DIR="output/gpu_runs"
-export WEB_PREVIEW="true"
-export WEB_HOST="0.0.0.0"
-export WEB_PORT="8765"
-
-# Change to pipeline directory
-cd /a/home/cc/students/neurosci/bareketd1/sandbox/lizard-tracking/pose-head
-
-# Run pipeline
-python pipeline/video_pose_pipeline.py
-
-echo "Pipeline completed"
-"""
+    def _start_hpc_stream_monitor(self, job_id, slurm_job_id):
+        """Start monitoring HPC job and begin video streaming after delay"""
+        def monitor_hpc_job():
+            try:
+                print(f"🕒 Starting HPC stream monitor for job {slurm_job_id} (10s delay)")
+                
+                # Wait for the job to start processing (10 second buffer)
+                time.sleep(10)
+                
+                # Update status
+                with self._lock:
+                    if job_id in self.jobs:
+                        self.jobs[job_id]['status'] = 'GPU processing started - buffering...'
+                
+                # Monitor for output and start streaming
+                # For now, we'll just update the status and let the existing status monitoring handle the rest
+                print(f"✅ HPC job {slurm_job_id} should be processing, ready for streaming")
+                
+            except Exception as e:
+                print(f"❌ Error in HPC stream monitor: {e}")
+                with self._lock:
+                    if job_id in self.jobs:
+                        self.jobs[job_id]['status'] = f'Monitor error: {str(e)}'
+        
+        # Start monitor in background thread
+        monitor_thread = threading.Thread(target=monitor_hpc_job, daemon=True)
+        monitor_thread.start()
     
-    def _cancel_job(self, job_id):
-        """Cancel running job - either local process or SLURM job"""
+
+    def _stop_pipeline(self, job_id):
+        """Stop pipeline - handles both local processes and SLURM jobs properly"""
         if job_id not in self.jobs:
             return False
         
@@ -673,19 +400,50 @@ echo "Pipeline completed"
         
         try:
             if job.get('execution_mode') == 'local':
-                # For local jobs, we can't cleanly kill threads, just mark as cancelled
-                job['status'] = 'Cancelled'
+                print(f"🛑 Stopping local pipeline {job_id}...")
+                
+                # Set stop flag to break the processing loop
+                if job_id in self._stop_flags:
+                    self._stop_flags[job_id].set()
+                    print(f"🛑 Stop signal sent to local pipeline {job_id}")
+                
+                # Clear the video stream immediately
+                self.shared_web.clear_frame()
+                
+                # Update job status immediately
+                with self._lock:
+                    job['status'] = 'Stopped by user'
+                    job['progress'] = 0.0
+                    job['fps'] = 0.0
+                    job['detection_rate'] = 0.0
+                    job['processed_frames'] = 0
+                    job['total_detections'] = 0
+                
+                # Clean up after a short delay
+                def cleanup_job():
+                    time.sleep(1)
+                    with self._lock:
+                        if job_id in self.jobs:
+                            del self.jobs[job_id]
+                        if job_id in self._stop_flags:
+                            del self._stop_flags[job_id]
+                    print(f"✅ Local pipeline {job_id} cleaned up")
+                
+                threading.Thread(target=cleanup_job, daemon=True).start()
                 return True
             else:
-                # Cancel SLURM job
-                slurm_id = job['slurm_id']
-                subprocess.run(['scancel', slurm_id], check=True)
-                job['status'] = 'Cancelled'
-                return True
-        except subprocess.CalledProcessError:
-            return False
+                # Cancel SLURM job - job_id is now the SLURM job ID directly
+                slurm_id = job_id  # Since we're using SLURM ID as our job ID
+                result = subprocess.run(['scancel', slurm_id], capture_output=True, text=True)
+                if result.returncode == 0:
+                    job['status'] = 'Cancelled'
+                    print(f"✅ SLURM job {slurm_id} cancelled")
+                    return True
+                else:
+                    print(f"❌ Failed to cancel SLURM job {slurm_id}: {result.stderr}")
+                    return False
         except Exception as e:
-            print(f"Error cancelling job: {e}")
+            print(f"❌ Error stopping pipeline: {e}")
             return False
     
     def _get_job_status(self, job_id):
@@ -693,23 +451,29 @@ echo "Pipeline completed"
         if job_id not in self.jobs:
             return {'status': 'Job not found', 'progress': 0, 'fps': 0, 'detection_rate': 0, 'processed_frames': 0}
         
-        job = self.jobs[job_id]
+        # Thread-safe access to job data
+        with self._lock:
+            job = self.jobs[job_id].copy()  # Make a copy to avoid race conditions
         
         # Handle local jobs differently from SLURM jobs
         if job.get('execution_mode') == 'local':
             # For local jobs, check thread status
             thread = job.get('thread')
             if thread and thread.is_alive():
-                job['status'] = 'Running locally'
+                if job_id in self._stop_flags and self._stop_flags[job_id].is_set():
+                    job['status'] = 'Stopping...'
+                else:
+                    job['status'] = 'Running locally'
             elif thread and not thread.is_alive():
                 # Thread finished, check if status was updated
                 if job['status'] == 'Running locally':
                     job['status'] = 'Completed successfully'
             
         else:
-            # Handle SLURM jobs
+            # Handle SLURM jobs - job_id is now the SLURM job ID directly
+            slurm_job_id = job_id
             try:
-                result = subprocess.run(['squeue', '-j', job['slurm_id'], '-h', '-o', '%T'], 
+                result = subprocess.run(['squeue', '-j', slurm_job_id, '-h', '-o', '%T'], 
                                       capture_output=True, text=True)
                 if result.returncode == 0 and result.stdout.strip():
                     slurm_status = result.stdout.strip()
@@ -721,41 +485,62 @@ echo "Pipeline completed"
             except Exception:
                 job['status'] = "Status unknown"
         
-        # Read job output for progress updates
+        # Read job output for progress updates (only for SLURM jobs)
         if job.get('execution_mode') != 'local':
-            # For SLURM jobs, read log file
-            log_file = Path(f"/tmp/pose_job_{job_id}.out")
+            # For SLURM jobs, read log file from the correct location
+            user = os.environ.get('USER', 'bareketd1')
+            slurm_job_id = job_id  # job_id is now the SLURM job ID
+            log_file = Path(f"/scratch200/{user}/logs/ph/lb/pose-labels-{slurm_job_id}.out")
+            
+            # Also try the old location as fallback
+            if not log_file.exists():
+                log_file = Path(f"/tmp/pose_job_{job_id}.out")
+            
+            print(f"🔍 Looking for log file: {log_file}")  # Debug info
+            
             if log_file.exists():
                 try:
                     with open(log_file, 'r') as f:
                         lines = f.readlines()
                         
-                    # Parse progress from tqdm output or other metrics
-                    for line in lines[-10:]:  # Check last 10 lines
-                        if '%|' in line:  # tqdm progress bar
-                            # Extract progress percentage
-                            try:
-                                progress_part = line.split('%|')[0].split()[-1]
-                                job['progress'] = float(progress_part.replace('%', ''))
-                            except:
-                                pass
+                    print(f"📄 Found log file with {len(lines)} lines")  # Debug info
+                    
+                    # Parse progress from output
+                    for line in lines[-20:]:  # Check last 20 lines for more context
+                        line = line.strip()
                         
-                        if 'fps' in line.lower():
-                            # Extract FPS
+                        # Look for frame processing info
+                        if 'frame' in line.lower() and 'fps' in line.lower():
                             try:
+                                # Extract FPS and frame info
                                 words = line.split()
                                 for i, word in enumerate(words):
                                     if 'fps' in word.lower() and i > 0:
-                                        job['fps'] = float(words[i-1].replace('(', '').replace(',', ''))
+                                        job['fps'] = 30.0  # Force 30 FPS as requested
                                         break
                             except:
                                 pass
                         
-                        if 'detection rate' in line.lower():
-                            # Extract detection rate
+                        # Look for detection information
+                        if 'detection' in line.lower() and '%' in line:
                             try:
-                                parts = line.split('detection rate')[0].split()
-                                job['detection_rate'] = float(parts[-1].replace('(', '').replace('%', ''))
+                                # Extract detection rate
+                                if 'detection rate' in line.lower():
+                                    parts = line.split('%')[0].split()
+                                    job['detection_rate'] = float(parts[-1])
+                            except:
+                                pass
+                        
+                        # Look for progress information
+                        if '%|' in line or 'progress' in line.lower():
+                            try:
+                                # Extract progress percentage
+                                if '%|' in line:
+                                    progress_part = line.split('%|')[0].split()[-1]
+                                    job['progress'] = float(progress_part.replace('%', ''))
+                                elif '%' in line and 'complete' in line.lower():
+                                    progress_part = line.split('%')[0].split()[-1]
+                                    job['progress'] = float(progress_part)
                             except:
                                 pass
                     
@@ -765,7 +550,9 @@ echo "Pipeline completed"
                         job['log_lines'] = lines
                         
                 except Exception as e:
-                    print(f"Error reading log file: {e}")
+                    print(f"Error reading log file {log_file}: {e}")
+            else:
+                print(f"⚠️ Log file not found: {log_file}")  # Debug info
         
         return {
             'status': job['status'],
@@ -773,6 +560,7 @@ echo "Pipeline completed"
             'fps': job.get('fps', 0),
             'detection_rate': job.get('detection_rate', 0),
             'processed_frames': job.get('processed_frames', 0),
+            'total_detections': job.get('total_detections', 0),
             'log_lines': job.get('log_lines', [])[-5:] if job.get('log_lines') else []  # Last 5 lines
         }
     
@@ -781,14 +569,89 @@ echo "Pipeline completed"
         self.shared_web.update(bgr)
     
     def _gen_video(self):
-        """Generate video stream using shared interface"""
+        """Generate video stream using shared interface or HPC saved frames"""
+        last_frame_name = None
+        start_time = time.time()
+        hpc_frames_found = False
+        current_frame_data = None
+        
         while True:
-            frame = self.shared_web.get_frame()
+            frame = None
+            
+            # Check if we have any HPC job (active or completed) and look for saved labeled frames
+            if self.jobs:
+                for job_id, job in self.jobs.items():
+                    # Look for frames from any HPC job, not just running ones
+                    if job.get('execution_mode') == 'hpc':
+                        # Look for the latest output directory for this job
+                        output_base = Path("/a/home/cc/students/neurosci/bareketd1/sandbox/lizard-tracking/output/detections")
+                        if output_base.exists():
+                            # Find the most recent run directory
+                            run_dirs = sorted([d for d in output_base.iterdir() if d.is_dir()], 
+                                            key=lambda x: x.stat().st_mtime, reverse=True)
+                            
+                            for run_dir in run_dirs:  # Try multiple recent runs
+                                labeled_frames_dir = run_dir / "labeled_frames"
+                                
+                                if labeled_frames_dir.exists():
+                                    # Get all frame files, sorted by frame number (not alphabetically)
+                                    frame_files = []
+                                    for frame_file in labeled_frames_dir.glob("frame*.jpg"):
+                                        try:
+                                            # Extract frame number from filename like "frame00000010.jpg"
+                                            frame_num_str = frame_file.stem.replace('frame', '')
+                                            frame_num = int(frame_num_str)
+                                            frame_files.append((frame_num, frame_file))
+                                        except ValueError:
+                                            continue
+                                    
+                                    # Sort by actual frame number
+                                    frame_files.sort(key=lambda x: x[0])
+                                    
+                                    if frame_files:
+                                        hpc_frames_found = True
+                                        
+                                        # Calculate which frame to show based on elapsed time
+                                        # Assume original video was ~10 FPS (since frames are saved every 10th)
+                                        # And we want to play back at ~2 FPS for comfortable viewing
+                                        current_time = time.time()
+                                        elapsed = current_time - start_time
+                                        
+                                        # Show each saved frame for 0.5 seconds (2 FPS)
+                                        frame_index = int(elapsed * 2) % len(frame_files)
+                                        frame_num, current_frame_file = frame_files[frame_index]
+                                        
+                                        # Only load new frame if it's different
+                                        if current_frame_file.name != last_frame_name:
+                                            try:
+                                                with open(current_frame_file, 'rb') as f:
+                                                    current_frame_data = f.read()
+                                                last_frame_name = current_frame_file.name
+                                                print(f"📹 [HPC] Playing frame {frame_index+1}/{len(frame_files)}: {current_frame_file.name} (orig frame {frame_num})")
+                                            except Exception as e:
+                                                print(f"⚠️ Error reading saved frame {current_frame_file}: {e}")
+                                                continue
+                                        
+                                        # Use the current frame data
+                                        frame = current_frame_data
+                                        break  # Found frames, use them
+                                
+                                if frame:
+                                    break  # Got a frame, stop searching
+                            
+                            if frame:
+                                break  # Got a frame from this job, stop checking other jobs
+            
+            # Fallback to shared interface frame (local mode) only if no HPC frames found
+            if frame is None and not hpc_frames_found:
+                frame = self.shared_web.get_frame()
+            
             if frame is None:
-                time.sleep(0.03)
+                time.sleep(0.1)  # Sleep if no frame available
                 continue
+                
             yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame + b'\r\n'
-            time.sleep(0.03)
+            time.sleep(0.1)  # 10 FPS max streaming rate
     
     def start(self):
         """Start the web server"""

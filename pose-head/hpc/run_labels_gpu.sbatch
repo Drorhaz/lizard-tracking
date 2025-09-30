@@ -9,8 +9,9 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G   
 #SBATCH --time=1:00:00
-#SBATCH --output=/scratch200/bareketd1/logs/ph/lb/%x-%j.out
-#SBATCH --error=/scratch200/bareketd1/logs/ph/lb/%x-%j.err
+#SBATCH --output=/scratch200/%u/logs/ph/lb/%x-%j.out
+#SBATCH --error=/scratch200/%u/logs/ph/lb/%x-%j.err
+
 
 set -euo pipefail
 mkdir -p logs
@@ -23,7 +24,7 @@ mkdir -p logs
 
 # Project root = directory of this sbatch file's parent
 
-BASE_PATH="/a/home/cc/students/neurosci/bareketd1/sandbox/lizard-tracking"
+BASE_PATH="/a/home/cc/students/neurosci/$USER/sandbox/lizard-tracking"
 cd "$BASE_PATH" || exit
 echo "[INFO] changed directory to: $BASE_PATH"
 
@@ -32,7 +33,7 @@ echo "[INFO] changed directory to: $BASE_PATH"
 CONDA_ENV="LizardPose"
 module load miniconda/miniconda3-4.7.12-environmentally
 source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "/scratch200/bareketd1/$CONDA_ENV"
+conda activate "/scratch200/$USER/$CONDA_ENV"
 echo "[INFO] activated conda env: $CONDA_ENV"
 
 #------------------------------------ log info ------------------------------------#
@@ -49,7 +50,9 @@ echo "[INFO] JOB_ID: ${SLURM_JOB_ID}"
 MODE="${MODE:-LABELS_ONLY}"
 PREVIEW="${PREVIEW:-false}"
 WEB_PREVIEW="${WEB_PREVIEW:-false}"
-set +a
+# set -a
+# source "$BASE_PATH/pose-head/config/.env"
+# set +a
 
 echo "Working dir: $(pwd)"
 echo "Video: ${VIDEO_PATH:-<unset>}"
@@ -62,7 +65,7 @@ python -m pip install --user ultralytics opencv-python-headless numpy python-dot
 PATH_TO_SCRIPT="$BASE_PATH/pose-head/pipeline/video_pose_pipeline.py" 
 echo "[INFO] running script: $PATH_TO_SCRIPT"
 
-python "$PATH_TO_SCRIPT"
+python "$PATH_TO_SCRIPT" --conf "$BASE_PATH/pose-head/config/.env"
 
 #------------------------------------ log info ------------------------------------#
 echo "[INFO] job finished"

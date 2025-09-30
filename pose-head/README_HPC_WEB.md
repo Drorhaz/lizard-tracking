@@ -27,7 +27,7 @@ An interactive web interface for submitting and monitoring lizard pose estimatio
 
 ### 1. Launch Web Interface
 ```bash
-cd /a/home/cc/students/neurosci/bareketd1/sandbox/lizard-tracking/pose-head
+cd /a/home/cc/students/neurosci/$USER/sandbox/lizard-tracking/pose-head
 python launch_hpc_web.py
 ```
 
