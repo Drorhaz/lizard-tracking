@@ -40,6 +40,12 @@ class SharedWebInterface:
         with self._frame_lock:
             return self._jpeg
     
+    def clear_frame(self):
+        """Clear the current frame (stop streaming)"""
+        with self._frame_lock:
+            self._jpeg = None
+            print("🔄 Video stream cleared")
+    
     @classmethod
     def get_instance(cls):
         """Get the singleton instance"""
