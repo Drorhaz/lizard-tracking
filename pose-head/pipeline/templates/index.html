@@ -2,54 +2,82 @@
 <html>
 <head>
     <meta charset='utf-8'>
-    <title>HPC Pose Pipeline</title>
+    <title>Pose Pipeline</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>🦎 HPC Pose Pipeline</h1>
+            <h1>🦎 Head Pose Pipeline</h1>
             <p>Real-time lizard pose estimation on GPU cluster</p>
         </div>
 
         <div class="controls">
             <h3>Pipeline Controls</h3>
-            <div class="form-group">
-                <label>Video File:</label>
-                <select id="videoSelect">
-                    <option value="">Select video...</option>
-                </select>
-            </div>
-            <div class="form-group">
-                <label>Execution Mode:</label>
-                <select id="executionMode" onchange="toggleExecutionOptions()">
-                    <option value="local">Local (CPU)</option>
-                    <option value="hpc">HPC Cluster (GPU)</option>
-                </select>
-            </div>
-
-            <div class="form-group" id="timeLimitGroup" style="display:none;">
-                <label>Time Limit:</label>
-                <input type="text" id="timeLimit" value="02:00:00" placeholder="HH:MM:SS">
-            </div>
-            <div class="form-group">
-                <label>Confidence Threshold:</label>
-                <input type="number" id="confThresh" value="0.10" min="0.05" max="1.0" step="0.05">
-            </div>
-            <div class="form-group">
-                <label>Image Size:</label>
-                <input type="number" id="imgSize" value="960" min="320" max="1920" step="32">
+            <div class="controls-grid">
+                <div class="controls-column">
+                    <div class="form-group">
+                        <label>Video File:</label>
+                        <select id="videoSelect">
+                            <option value="">Select video...</option>
+                            {% for video in videos %}
+                            <option value="{{ video.path }}">{{ video.name }}</option>
+                            {% endfor %}
+                            {% if not videos %}
+                            <option value="" disabled>No videos found</option>
+                            {% endif %}
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Execution Mode:</label>
+                        <select id="executionMode" onchange="toggleExecutionOptions()">
+                            <option value="local">Local (CPU)</option>
+                            <option value="local_gpu">Local (GPU)</option>
+                            <option value="hpc">HPC Cluster (GPU)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Detection Mode:</label>
+                        <div class="glass-toggle-container">
+                            <input type="radio" id="liveMode" name="detectionMode" value="live" checked onchange="toggleDetectionMode()">
+                            <input type="radio" id="offlineMode" name="detectionMode" value="offline" onchange="toggleDetectionMode()">
+                            <div class="glass-toggle-switch">
+                                <div class="glass-toggle-slider"></div>
+                                <div class="glass-toggle-labels">
+                                    <span class="toggle-label-left">🔴 Live</span>
+                                    <span class="toggle-label-right">📁 Offline</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>Save Labels:</label>
+                        <input type="checkbox" id="saveLabels" checked>
+                        <span class="checkbox-label"></span>
+                    </div>
+                </div>
+                <div class="controls-column">
+                    <div class="form-group" id="timeLimitGroup" style="display:none;">
+                        <label>Time Limit:</label>
+                        <input type="text" id="timeLimit" value="02:00:00" placeholder="HH:MM:SS">
+                    </div>
+                    <div class="form-group">
+                        <label>Confidence Threshold:</label>
+                        <input type="number" id="confThresh" value="0.10" min="0.05" max="1.0" step="0.05">
+                    </div>
+                    <div class="form-group">
+                        <label>Image Size:</label>
+                        <input type="number" id="imgSize" value="960" min="320" max="1920" step="32">
+                    </div>
+                </div>
             </div>
             
-            <div style="margin-top: 20px;">
+            <div class="btn-container">
                 <button class="btn" id="playBtn" onclick="startPipeline()">
                     ▶️ Start Pipeline
                 </button>
                 <button class="btn btn-stop hidden" id="stopBtn" onclick="stopPipeline()">
                     ⏹️ Stop Pipeline
-                </button>
-                <button class="btn" id="viewRunsBtn" onclick="viewCompletedRuns()" style="background: #2196F3;">
-                    🎬 View Completed Runs
                 </button>
             </div>
         </div>
