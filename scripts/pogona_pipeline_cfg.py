@@ -23,7 +23,7 @@ CONFIG = {
     "epochs": 150,
     "imgsz": 640,
     "batch": 16,
-    "device": "cpu",
+    "device": "cpu", # "cpu" or 0
     "lr0": 0.01,
     "weight_decay": 5e-4,
     "patience": None,
