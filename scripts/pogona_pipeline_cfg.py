@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-SRC_DIR = ROOT_DIR / "src"
+SRC_DIR = ROOT_DIR / "lib"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
@@ -23,7 +23,7 @@ CONFIG = {
     "epochs": 150,
     "imgsz": 640,
     "batch": 16,
-    "device": 0,
+    "device": "cpu",
     "lr0": 0.01,
     "weight_decay": 5e-4,
     "patience": None,
@@ -32,7 +32,7 @@ CONFIG = {
     "run_name": "pogona_head_pose",
     "extra_overrides": {},  # additional Ultralytics overrides
     "export_best_to": "output/models/head_pose/best.pt",
-    "skip_training": True,
+    "skip_training": False,
 }
 
 
@@ -70,7 +70,7 @@ def main() -> None:
             print(f"[EXPORT] Copied best checkpoint to {export_path.resolve()}")
     else:
         print("[WARN] No checkpoint available to export")
-
+ 
 
 if __name__ == "__main__":
     main()
