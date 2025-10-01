@@ -9,8 +9,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G   
 #SBATCH --time=12:00:00
-#SBATCH --output=/scratch200/bareketd1/logs/ph/%x-%j.out
-#SBATCH --error=/scratch200/bareketd1/logs/ph/%x-%j.err
+#SBATCH --output=/scratch200/%u/logs/ph/%x-%j.out
+#SBATCH --error=/scratch200/%u/logs/ph/%x-%j.err
 
 
 
@@ -22,7 +22,7 @@ echo "[INFO] changed directory to: $BASE_PATH"
 CONDA_ENV="LizardPose"
 module load miniconda/miniconda3-4.7.12-environmentally
 source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "/scratch200/bareketd1/$CONDA_ENV"
+conda activate "/scratch200/$USER/$CONDA_ENV"
 echo "[INFO] activated conda env: $CONDA_ENV"
 
 #------------------------------------ log info ------------------------------------#
@@ -36,7 +36,7 @@ echo "[INFO] JOB_ID: ${SLURM_JOB_ID}"
 #------------------------------------ run script ------------------------------------#
 
 
-PATH_TO_SCRIPT="$BASE_PATH/scripts/pogona_pipeline_cfg.py" #pogona_pipeline_cfg_optuna
+PATH_TO_SCRIPT="$BASE_PATH/src/scripts/pogona_pipeline_cfg.py" #pogona_pipeline_cfg_optuna
 echo "[INFO] running script: $PATH_TO_SCRIPT"
 
 python "$PATH_TO_SCRIPT"

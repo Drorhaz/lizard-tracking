@@ -1,8 +1,27 @@
+# Core
 ultralytics>=8.3.0
-# Install the correct PyTorch build for your platform:
-torch>=2.2.0
-torchvision>=0.17.0
+torch>=2.1
+torchvision>=0.16
+numpy>=1.24
 opencv-python
-numpy
-matplotlib
+pandas
 tqdm
+optuna
+
+# IO & numerics
+numpy>=1.24
+pandas>=2.0
+pyarrow>=15.0
+
+# Video & drawing
+opencv-python>=4.9.0.80
+
+# CLI & config
+python-dotenv>=1.0.1
+pyyaml>=6.0
+typer>=0.12.3
+
+# Dev / tests (optional but recommended)
+pytest>=7.4
+pytest-cov>=4.1
+matplotlib>=3.8

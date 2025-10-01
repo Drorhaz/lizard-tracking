@@ -6,11 +6,13 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 import pandas as pd
 import matplotlib.pyplot as plt
+import re
+
 
 # ----------------------------- CONFIG (edit here) ----------------------------- #
 CONFIG: Dict[str, Any] = {
     "RUNS_DIR": "runs/pose",
-    "OUT_DIR": "output/compare_models",
+    "OUT_DIR": "output/compare",
     "INCLUDE": [],                    # substrings to include (empty => include all)
     "EXCLUDE": ["predict", "traincache"],
     "MAX_EPOCHS": None,               # cap epochs per run for plotting
@@ -40,13 +42,22 @@ CONFIG: Dict[str, Any] = {
 # ----------------------------------------------------------------------------- #
 
 # Candidate columns where various Ultralytics versions store mAP
+
 MAP_CANDS = [
+    "metrics/mAP50-95(P)",
+    "metrics/mAP50(P)",
+    "metrics/mAP50-95(B)",
+    "metrics/mAP50(B)",
     "metrics/pose/mAP50-95",
-    "metrics/pose/kpt_mAP50-95",
+    "metrics/pose/mAP@0.5:0.95",
     "keypoints/mAP50-95",
+    "keypoints/mAP@0.5:0.95",
     "metrics/mAP50-95",
+    "metrics/mAP@0.5:0.95",
     "mAP50-95",
     "map50-95",
+    "pose/mAP50-95",
+    "val/pose_map50-95",
     "metrics/box/mAP50-95",
     "box/mAP50-95",
 ]
@@ -79,10 +90,25 @@ def _clip(df: pd.DataFrame) -> pd.DataFrame:
     if m is None: return df
     return df[df["epoch"] < m] if "epoch" in df.columns else df.iloc[:m, :]
 
-def _pick_map(df: pd.DataFrame) -> Optional[str]:
+def _pick_map(df: pd.DataFrame) -> str | None:
+    cols = set(df.columns)
+
+    # 1) exact priority list
     for c in MAP_CANDS:
-        if c in df.columns:
+        if c in cols:
             return c
+
+    # 2) flexible regex: prefer pose '(P)' first, then any 0.5:0.95-ish
+    #    e.g., "metrics/mAP50-95(P)" or "metrics/mAP@0.5:0.95 (P)"
+    for c in df.columns:
+        if re.search(r"mAP\s*50-?95.*\(P\)", c, flags=re.I) or re.search(r"mAP@?0\.5:?0\.95.*\(P\)", c, flags=re.I):
+            return c
+
+    # 3) any mAP50-95 style if nothing with (P) found
+    for c in df.columns:
+        if re.search(r"mAP\s*50-?95", c, flags=re.I) or re.search(r"mAP@?0\.5:?0\.95", c, flags=re.I):
+            return c
+
     return None
 
 def _key_losses(df: pd.DataFrame) -> List[str]:

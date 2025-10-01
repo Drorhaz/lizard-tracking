@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=pogona_optuna
-#SBATCH --account=sheinmark-users
+# #SBATCH --account=YOUR_ACCOUNT_HERE  # Set your SLURM account
 #SBATCH --partition=gpu-general
 #SBATCH --gpus-per-task=1
 #SBATCH --gres=gpu:1   
@@ -9,8 +9,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G   
 #SBATCH --time=8:00:00
-#SBATCH --output=/scratch200/bareketd1/logs/ph/compare/%x-%j.out
-#SBATCH --error=/scratch200/bareketd1/logs/ph/compare/%x-%j.err
+#SBATCH --output=/scratch200/%u/logs/ph/compare/%x-%j.out
+#SBATCH --error=/scratch200/%u/logs/ph/compare/%x-%j.err
 
 
 
@@ -22,7 +22,7 @@ echo "[INFO] changed directory to: $BASE_PATH"
 CONDA_ENV="LizardPose"
 module load miniconda/miniconda3-4.7.12-environmentally
 source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "/scratch200/bareketd1/$CONDA_ENV"
+conda activate "/scratch200/$USER/$CONDA_ENV"
 echo "[INFO] activated conda env: $CONDA_ENV"
 
 #------------------------------------ log info ------------------------------------#
