@@ -37,6 +37,25 @@ class HPCWebInterface:
         
         self.setup_routes()
         
+    def _get_project_root(self):
+        """Find the lizard-tracking project root directory"""
+        # Start from current file location and walk up to find project root
+        current_path = Path(__file__).parent.absolute()
+        
+        # Look for project indicators (pyproject.toml, requirements.txt, etc.)
+        while current_path.parent != current_path:  # Not at filesystem root
+            if any((current_path / indicator).exists() for indicator in 
+                   ['pyproject.toml', 'requirements.txt', '.git', 'README.md']):
+                # Double-check this looks like our project
+                if (current_path / 'pose-head').exists() or current_path.name == 'lizard-tracking':
+                    return current_path
+            current_path = current_path.parent
+        
+        # Fallback: assume we're in pose-head/pipeline and go up two levels
+        fallback = Path(__file__).parent.parent.parent
+        print(f"⚠️  Using fallback project root: {fallback}")
+        return fallback
+        
     def setup_routes(self):
         @self.app.route('/')
         def index():
@@ -88,7 +107,8 @@ class HPCWebInterface:
         def check_saved_labels():
             """Check if saved labels exist for a video"""
             video_name = request.json.get('video_name')
-            output_base = Path("/a/home/cc/students/neurosci/bareketd1/sandbox/lizard-tracking/output/detections")
+            project_root = self._get_project_root()
+            output_base = project_root / "output" / "detections"
             
             found = False
             if output_base.exists():
@@ -108,7 +128,8 @@ class HPCWebInterface:
         def list_completed_runs():
             """List available completed runs with labeled frames"""
             runs = []
-            output_base = Path("/a/home/cc/students/neurosci/bareketd1/sandbox/lizard-tracking/output/detections")
+            project_root = self._get_project_root()
+            output_base = project_root / "output" / "detections"
             if output_base.exists():
                 run_dirs = sorted([d for d in output_base.iterdir() if d.is_dir()], 
                                 key=lambda x: x.stat().st_mtime, reverse=True)
@@ -132,19 +153,22 @@ class HPCWebInterface:
         seen_paths = set()  # Track unique video paths to avoid duplicates
         print("🔍 Starting video scan...")
         
-        # Look in common video directories - check multiple possible locations
+        # Get project root and build relative paths
+        project_root = self._get_project_root()
+        print(f"📁 Project root: {project_root}")
+        
+        # Look in common video directories - use relative paths from project root
         video_dirs = [
-            Path("videos"),  # Local videos directory
+            project_root / "videos",  # Main project videos
+            project_root / "scripts",  # Scripts folder
+            project_root / "dataset" / "videos",  # Dataset videos
+            project_root / "data" / "videos",  # Data videos
+            Path("videos"),  # Local relative videos
             Path("../videos"),  # Parent directory videos
             Path("../../videos"),  # Grandparent directory videos
-            Path("/a/home/cc/students/neurosci/bareketd1/sandbox/lizard-tracking/videos"),  # Main repo videos
-            Path("/scratch200/bareketd1/videos"),  # Scratch videos
-            Path("/scratch200/bar/lizard-tracking/pose-head/videos"),  # Symlinked location
-            Path("/scratch200/bareketd1/LizardPose/videos"),  # LizardPose env videos
-            Path("scripts"),  # Scripts folder
+            Path("scripts"),  # Local scripts folder
             Path("../scripts"),  # Parent scripts
             Path("../../scripts"),  # Grandparent scripts
-            Path("/a/home/cc/students/neurosci/bareketd1/sandbox/lizard-tracking/scripts"),  # Absolute scripts
         ]
         
         for video_dir in video_dirs:
@@ -170,12 +194,12 @@ class HPCWebInterface:
             else:
                 print(f"❌ Directory not found: {video_dir}")
         
-        print(f"� Total videos found: {len(videos)}")
+        print(f"🎬 Total videos found: {len(videos)}")
         if len(videos) == 0:
             print("⚠️  No videos found! Please check that video files exist in:")
-            print("   - videos/ directory")
-            print("   - ../videos/ directory") 
-            print("   - scripts/ directory")
+            print(f"   - {project_root}/videos/ directory")
+            print(f"   - {project_root}/scripts/ directory") 
+            print("   - videos/ relative to current directory")
         
         return videos
     
@@ -210,7 +234,8 @@ class HPCWebInterface:
                 print(f"📁 Loading saved labels for video: {video_name}")
                 
                 # Find the most recent run with labeled frames for this video
-                output_base = Path("/a/home/cc/students/neurosci/bareketd1/sandbox/lizard-tracking/output/detections")
+                project_root = self._get_project_root()
+                output_base = project_root / "output" / "detections"
                 labeled_frames_dir = None
                 
                 if output_base.exists():
@@ -344,9 +369,21 @@ class HPCWebInterface:
                         print(f"🤖 Loading YOLO model...")
                         from ultralytics import YOLO
                         
-                        # Use model path from config or default
-                        model_path = config.get('model_path', '/a/home/cc/students/neurosci/bareketd1/sandbox/lizard-tracking/yolo11s-pose.pt')
-                        model = YOLO(model_path)
+                        # Use model path from config or find default in project root
+                        if 'model_path' in config:
+                            model_path = config['model_path']
+                        else:
+                            project_root = self._get_project_root()
+                            # Look for common model files in project root
+                            for model_name in ['yolo11s-pose.pt', 'yolo11n-pose.pt', 'best.pt']:
+                                model_path = project_root / model_name
+                                if model_path.exists():
+                                    break
+                            else:
+                                # Fallback to relative path
+                                model_path = 'yolo11s-pose.pt'
+                        
+                        model = YOLO(str(model_path))
                         
                         # Set device based on execution mode
                         if execution_mode == 'local_gpu':
@@ -367,7 +404,11 @@ class HPCWebInterface:
                 model = None
                 if config.get('detection_mode', 'live') == 'live':
                     import sys
-                    sys.path.append('/a/home/cc/students/neurosci/bareketd1/sandbox/lizard-tracking/pose-head')
+                    # Add project paths to Python path for imports
+                    project_root = self._get_project_root()
+                    pose_head_path = project_root / "pose-head"
+                    if pose_head_path.exists():
+                        sys.path.append(str(pose_head_path))
                     from pipeline.video_pose_pipeline import YOLOPoseModel, draw_overlay
                     
                     model_dir = Path("../output/models/head_pose")
@@ -524,12 +565,12 @@ class HPCWebInterface:
             env['SMOOTH_PLAYBACK'] = 'true'  # Enable smooth frame timing
             
             # Change to the correct directory and run the existing script
-            script_path = Path("../hpc/submit_labels_gpu.sh").resolve()
+            script_path = Path("hpc/submit_labels_gpu.sh").resolve()
             if not script_path.exists():
-                script_path = Path("hpc/submit_labels_gpu.sh").resolve()
+                script_path = Path("../hpc/submit_labels_gpu.sh").resolve()
             
             if not script_path.exists():
-                print(f"❌ Could not find submit_labels_gpu.sh script")
+                print(f"❌ Could not find submit_labels_gpu.sh script in hpc/ directory")
                 return None
             
             print(f"🚀 Using existing SLURM script: {script_path}")
@@ -713,19 +754,27 @@ class HPCWebInterface:
                 job['status'] = "Status unknown"
         
         # Read job output for progress updates (only for SLURM jobs)
-        if job.get('execution_mode') != 'local':
-            # For SLURM jobs, read log file from the correct location
-            user = os.environ.get('USER', 'bareketd1')
+        if job.get('execution_mode') not in ['local', 'local_gpu']:
+            # For SLURM jobs, try multiple log file locations
+            user = os.environ.get('USER', os.environ.get('LOGNAME', 'user'))
             slurm_job_id = job_id  # job_id is now the SLURM job ID
-            log_file = Path(f"/scratch200/{user}/logs/ph/lb/pose-labels-{slurm_job_id}.out")
             
-            # Also try the old location as fallback
-            if not log_file.exists():
-                log_file = Path(f"/tmp/pose_job_{job_id}.out")
+            # Try multiple possible log locations
+            possible_log_paths = [
+                Path(f"/scratch200/{user}/logs/ph/lb/pose-labels-{slurm_job_id}.out"),  # HPC location
+                Path(f"/tmp/pose_job_{job_id}.out"),  # Temp location
+                Path.home() / "logs" / f"pose-labels-{slurm_job_id}.out",  # Home logs
+                Path(f"pose_job_{job_id}.out"),  # Current directory
+            ]
             
-            print(f"🔍 Looking for log file: {log_file}")  # Debug info
+            log_file = None
+            for possible_path in possible_log_paths:
+                if possible_path.exists():
+                    log_file = possible_path
+                    break
             
-            if log_file.exists():
+            if log_file:
+                print(f"🔍 Reading log file: {log_file}")  # Debug info
                 try:
                     with open(log_file, 'r') as f:
                         lines = f.readlines()
@@ -811,7 +860,9 @@ class HPCWebInterface:
                     # Look for frames from any HPC job, not just running ones
                     if job.get('execution_mode') == 'hpc':
                         # Look for the latest output directory for this job
-                        output_base = Path("/a/home/cc/students/neurosci/bareketd1/sandbox/lizard-tracking/output/detections")
+                        # Extract stats and create output directory structure
+                        project_root = self._get_project_root()
+                        output_base = project_root / "output" / "detections"
                         if output_base.exists():
                             # Find the most recent run directory
                             run_dirs = sorted([d for d in output_base.iterdir() if d.is_dir()], 
