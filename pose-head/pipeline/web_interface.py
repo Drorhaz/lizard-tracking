@@ -160,6 +160,7 @@ class HPCWebInterface:
         # Look in common video directories - use relative paths from project root
         video_dirs = [
             project_root / "videos",  # Main project videos
+            project_root / "pose-head" / "videos",  # Pose-head videos directory
             project_root / "scripts",  # Scripts folder
             project_root / "dataset" / "videos",  # Dataset videos
             project_root / "data" / "videos",  # Data videos
