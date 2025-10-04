@@ -1,11 +1,14 @@
-# Real-Time Lizard Tracking — Head Detection
+# Real-Time Lizard Tracking — Head Detection & Behavioral Analysis
 
-This repo contains the code and assets for **real-time lizard head detection** using YOLO (v11 small) and the project workflow described in the initial report.
+This repo contains the code and assets for **real-time lizard head detection and behavioral analysis** using YOLO (v11 small) with integrated trajectory analysis and activity detection capabilities.
 
 ## 🏆 **Current Results**
 - **Model**: YOLOv11s (9.4M parameters)
 - **Best Performance**: **98.3% mAP@0.5** (CPU training, 3 epochs)
 - **Dataset**: 2,974 labeled images (thermal + visible)
+- **Behavioral Analysis**: ✅ Real-time behavioral analysis and trajectory reconstruction
+- **Libraries**: ✅ Modular `lib/lizard_tracking` and `lib/behavioral_analysis` 
+- **Web Interface**: ✅ Interactive pose-head pipeline with video discovery
 - **Status**: ✅ Dataset validated, ready for production CUDA training
 
 ## 🚨 **CRITICAL: MPS Training Issue**
@@ -34,8 +37,13 @@ We discovered a PyTorch MPS backend bug that causes **silent training failure**:
 
 ## Quick Start
 
-### 0) Install dependencies
+### 0) Environment Setup
+**IMPORTANT**: Use the correct conda environment for all operations:
 ```bash
+# Activate the LizardPose environment
+conda activate /scratch200/bareketd1/LizardPose
+
+# Or set up a new environment (if needed)
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
@@ -69,15 +77,25 @@ Every training run also drops a `results.csv`. You can plot the losses and valid
 python tools/analyze_pose_runs.py plot runs/pose/pogona_head_pose2 --out plots/pogona_head_pose2.png
 ```
 
-### 4) Offline video tracking
+### 4) Real-time Behavioral Analysis
+Use the integrated behavioral analysis library for advanced tracking:
 ```bash
-python src/lizard_tracking/api.py --track \
+# Real-time behavioral analysis with trajectory reconstruction
+python lib/behavioral_analysis/detector.py
+
+# Web interface for pose detection and behavioral analysis
+cd pose-head/pipeline && python web_interface.py
+```
+
+### 5) Offline video tracking
+```bash
+python lib/lizard_tracking/api.py --track \
   --video videos/sample.mp4 \
   --weights runs/pose/pogona_head_pose2/weights/best.pt
 ```
 This produces a CSV (and optional parquet) plus an overlay video under `output/`.
 
-### 5) Live demo / UI smoke-test
+### 6) Live demo / UI smoke-test
 ```bash
 python -m lizard_tracking.ui.stream --source 0 --weights runs/pose/pogona_head_pose2/weights/best.pt
 ```
@@ -88,7 +106,9 @@ Press `q` to exit the OpenCV preview window. Activity events are emitted to stdo
 ## Repository Map
 - **configs/** – Dataset definitions and end-to-end pipeline YAML bundles
 - **scripts/** – Training scripts and HPC job wrappers
-- **lib/lizard_tracking/** – Core library (training pipelines, models, configs)
+- **lib/lizard_tracking/** – Core pose detection library (training pipelines, models, configs)
+- **lib/behavioral_analysis/** – Behavioral analysis library (trajectory reconstruction, activity detection)
+- **pose-head/pipeline/** – Web interface for pose detection and behavioral analysis
 - **tests/** – Smoke tests for inference and trajectory logging
 - **output/**, **runs/** – Generated artefacts (ignored in Git)
 
@@ -96,9 +116,11 @@ Press `q` to exit the OpenCV preview window. Activity events are emitted to stdo
 - `scripts/pogona_pipeline_cfg.py` – single-run training/validation harness.
 - `scripts/pogona_pipeline_cfg_optuna.py` – Optuna hyper-parameter sweeps (writes `optuna_###` runs).
 - `scripts/train_pose.sh` / `run_train_gpu.sh` – shell wrappers used on SLURM.
+- `lib/behavioral_analysis/trajectory.py` – trajectory reconstruction and analysis.
+- `lib/behavioral_analysis/detector.py` – real-time behavioral pattern detection.
+- `pose-head/pipeline/web_interface.py` – web-based pose detection interface.
 - `tools/analyze_pose_runs.py` – compares runs and plots loss/metric curves.
-- `tools/run_pose_stream.py` – streams detections, logs trajectory CSVs, and saves labeled frames for retraining.
-- `labeler/label_qc_web.py` – browser label editor (run `python labeler/label_qc_web.py`).
+- `webapps/label_qc_web.py` – browser label editor (run `python webapps/label_qc_web.py`).
 
 ## Training vs validation metrics
 
@@ -118,9 +140,13 @@ python tools/analyze_pose_runs.py plot runs/pose/pogona_head_pose2 --out plots/p
 ```
 When run without arguments it reads the config embedded at the top of the script, compares the configured runs, and saves everything under `output/analytics/` (CSV + PNGs). The helper also drops a bar chart highlighting the best `mAP@0.5:0.95`.
 
-### 6) Live tracking + trajectory logging
+### 7) Live tracking + trajectory logging
 Once you have a trained checkpoint copied to `output/models/head_pose/best.pt`, stream a video or camera feed and archive detections:
 ```bash
+# Using the new behavioral analysis library
+python lib/behavioral_analysis/detector.py
+
+# Or using the legacy stream tool
 python tools/run_pose_stream.py
 ```
 Edit the config block at the top of the script to point at your video/camera and to adjust the logging cadence (`frame_stride`, `save_every`). Each run writes to `output/detections/<name>_<timestamp>/` with:
@@ -128,6 +154,19 @@ Edit the config block at the top of the script to point at your video/camera and
 - `overlay.mp4` (optional) for a quick preview
 - `labeled_frames/` with raw frames, overlays, and YOLO pose labels for retraining
 Events (advance/retreat/stop) are echoed to stdout in real time.
+
+### 8) Behavioral Analysis & Trajectory Reconstruction
+Use the dedicated behavioral analysis library:
+```bash
+# Reconstruct trajectories from pose data
+python lib/behavioral_analysis/trajectory.py
+
+# Real-time behavioral pattern detection
+python lib/behavioral_analysis/detector.py
+
+# Web interface with integrated behavioral analysis
+cd pose-head/pipeline && python web_interface.py
+```
 
 ## Model selection workflow
 1. Launch `scripts/pogona_pipeline_cfg_optuna.py` to explore learning-rate/weight-decay/imgsz combinations. Finished runs appear as `runs/pose/optuna_###`.
@@ -171,7 +210,26 @@ Detailed training documentation and results are available:
 
 ## Known issues
 - **MPS training on Mac:** Confirmed silent failure → always run `train_sanity.py` on CPU first.
+- **Environment:** Use `/scratch200/bareketd1/LizardPose` conda environment for all operations.
+- **Imports:** Fixed lizard_tracking module imports in scripts (config and pipelines).
 - **Large files:** Don't commit datasets or weights (`*.pt`); use Git LFS if needed.
+
+## 🧬 **Behavioral Analysis Features**
+
+### Libraries
+- **`lib/lizard_tracking/`** - Core pose detection and YOLO training pipelines
+- **`lib/behavioral_analysis/`** - Dedicated behavioral analysis library with:
+  - Real-time activity detection (advance/retreat/stop patterns)
+  - Trajectory reconstruction from pose keypoints  
+  - Event-driven behavioral metrics
+  - Export capabilities for further analysis
+
+### Web Interface
+- **`pose-head/pipeline/web_interface.py`** - Interactive web interface featuring:
+  - Automatic video discovery across project directories
+  - Real-time pose detection with behavioral overlay
+  - SLURM job submission for batch processing
+  - Live streaming with activity event detection
 
 ---
 
