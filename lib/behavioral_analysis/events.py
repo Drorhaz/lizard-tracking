@@ -3,7 +3,25 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from typing import Dict, Any, List, Callable, Optional
 from datetime import datetime
+from enum import Enum
 import json
+
+
+class EventType(Enum):
+    """Enumeration of behavioral event types."""
+    APPROACH = "approach"
+    RETREAT = "retreat"
+    STOP = "stop"
+    APPROACH_START = "approach_start"
+    APPROACH_END = "approach_end"
+    RETREAT_START = "retreat_start"
+    RETREAT_END = "retreat_end"
+    STOP_START = "stop_start"
+    STOP_END = "stop_end"
+    CLOSE_TO_TARGET = "close_to_target"
+    FAR_FROM_TARGET = "far_from_target"
+    FAST_MOVEMENT = "fast_movement"
+    DIRECTION_CHANGE = "direction_change"
 
 
 @dataclass
@@ -11,12 +29,21 @@ class BehaviorEvent:
     """Represents a detected behavioral event."""
     
     event_type: str          # "approach", "retreat", "stop", "close", "far", etc.
-    timestamp: float         # Unix timestamp
     frame_number: int        # Frame number when event occurred
-    confidence: float        # Confidence score (0.0 to 1.0)
     position: tuple[float, float]  # (x, y) position when event occurred
-    metrics: Dict[str, Any]  # Additional metrics (speed, distance, etc.)
+    timestamp: float = 0.0   # Unix timestamp (auto-generated if not provided)
+    confidence: float = 1.0  # Confidence score (0.0 to 1.0)
+    metrics: Optional[Dict[str, Any]] = None  # Additional metrics (speed, distance, etc.)
     metadata: Optional[Dict[str, Any]] = None  # Optional additional data
+    
+    def __post_init__(self):
+        """Auto-generate timestamp if not provided."""
+        if self.timestamp == 0.0:
+            from time import time
+            self.timestamp = time()
+        # Merge metadata into metrics if metrics is None
+        if self.metrics is None and self.metadata is not None:
+            self.metrics = self.metadata.copy()
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert event to dictionary for serialization."""
@@ -72,6 +99,10 @@ class EventBus:
                 callback(event)
             except Exception as e:
                 print(f"Error in global event callback: {e}")
+    
+    def publish(self, event: BehaviorEvent):
+        """Publish an event (alias for emit)."""
+        self.emit(event)
     
     def get_recent_events(self, event_type: Optional[str] = None, limit: int = 10) -> List[BehaviorEvent]:
         """Get recent events, optionally filtered by type."""
