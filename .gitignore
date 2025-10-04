@@ -10,9 +10,10 @@ dataset/
 
 output/*
 !output/models/
-!output/comarison/
+!output/compare/
 !output/detections/top_20250916T150021-20251001T004728
 *backup*
+
 
 *.env
 */config/.env
