@@ -1,0 +1,20 @@
+{
+  "MODE": "LABELS_ONLY",
+  "VIDEO_PATH": "/scratch200/bar/lizard-tracking/pose-head/videos/top_20250916T150021.mp4",
+  "MODEL_PATH": "",
+  "MODEL_DIR": "/a/home/cc/students/neurosci/bareketd1/sandbox/lizard-tracking/output/models/head_pose",
+  "OUTPUT_DIR": "/a/home/cc/students/neurosci/bareketd1/sandbox/lizard-tracking/output/detections",
+  "PROCESS_EVERY_N": 1,
+  "LABEL_EVERY_N": 10,
+  "PREVIEW": false,
+  "WINDOW_NAME": "Pose Overlay",
+  "FPS_LIMIT": 0.0,
+  "IMG_SIZE": 960,
+  "CONF_THRESH": 0.1,
+  "IOU_THRESH": 0.5,
+  "PREVIEW_MAX_W": 900,
+  "WEB_PREVIEW": true,
+  "WEB_HOST": "0.0.0.0",
+  "WEB_PORT": 8765,
+  "HPC_MODE": false
+}
