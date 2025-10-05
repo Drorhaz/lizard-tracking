@@ -54,8 +54,13 @@ try:
     from behavioral_analysis.config import BehaviorConfig
     from behavioral_analysis.events import EventType
     from behavioral_analysis.metrics import LiveMetrics
+    # Import advanced behavioral analysis
+    from behavioral_analysis.config_advanced import AdvancedBehaviorConfig
+    from behavioral_analysis.detector_advanced import AdvancedBehavioralDetector
+    from behavioral_analysis.plotter import create_nose_heading_map, save_events_csv, save_trajectory_csv
     BEHAVIOR_ANALYSIS_AVAILABLE = True
-    print("✅ Behavioral analysis imported successfully (with LiveMetrics)")
+    ADVANCED_BEHAVIOR_AVAILABLE = True
+    print("✅ Behavioral analysis imported successfully (with LiveMetrics + Advanced)")
 except ImportError as e:
     print(f"⚠️ Behavioral analysis import failed: {e}")
     BEHAVIOR_ANALYSIS_AVAILABLE = False
@@ -114,18 +119,34 @@ def save_run_config(run_dir: Path, cfg: dict):
         json.dump(cfg, fp, indent=2)
 
 def save_yolo_label_txt(path_txt: Path, cls_id: int, bbox_xyxy: Tuple[float,float,float,float], 
-                       img_w: int, img_h: int, conf: Optional[float] = None):
-    """Save detection in YOLO format"""
+                       img_w: int, img_h: int, conf: Optional[float] = None, 
+                       keypoints: Optional[list] = None):
+    """Save detection in YOLO pose format with keypoints"""
     x1,y1,x2,y2 = bbox_xyxy
     bw = x2-x1; bh = y2-y1
     cx = x1 + bw/2.0; cy = y1 + bh/2.0
     nx = cx / img_w; ny = cy / img_h; nw = bw / img_w; nh = bh / img_h
     path_txt.parent.mkdir(parents=True, exist_ok=True)
     with open(path_txt, "w") as f:
+        # Start with bbox and confidence
         if conf is None:
-            f.write(f"{cls_id} {nx:.6f} {ny:.6f} {nw:.6f} {nh:.6f}\n")
+            line = f"{cls_id} {nx:.6f} {ny:.6f} {nw:.6f} {nh:.6f}"
         else:
-            f.write(f"{cls_id} {nx:.6f} {ny:.6f} {nw:.6f} {nh:.6f} {conf:.6f}\n")
+            line = f"{cls_id} {nx:.6f} {ny:.6f} {nw:.6f} {nh:.6f} {conf:.6f}"
+        
+        # Add keypoints if available (YOLO pose format: x y visibility for each keypoint)
+        if keypoints:
+            for kpt in keypoints:
+                if kpt is not None:
+                    kpt_x, kpt_y = kpt
+                    # Normalize keypoint coordinates
+                    norm_x = kpt_x / img_w
+                    norm_y = kpt_y / img_h
+                    line += f" {norm_x:.6f} {norm_y:.6f} 2"  # visibility=2 (visible)
+                else:
+                    line += " 0.0 0.0 0"  # visibility=0 (not labeled)
+        
+        f.write(line + "\n")
 
 def save_labeled_frame(path_img: Path, frame: np.ndarray, max_w: int = 900):
     """Save processed frame image"""
@@ -152,20 +173,46 @@ class SimpleHeadPoseDetector:
         self.fps = 10
         self.detection_count = 0
         
-        # Initialize behavioral detector for trajectory-based analysis
-        if BEHAVIOR_ANALYSIS_AVAILABLE:
+        # Trajectory logging for detailed CSV export
+        self.trajectory_log = []  # Store detailed per-frame data
+        self.start_time = time.time()
+        
+        # Initialize ADVANCED behavioral detector with arena mapping
+        self.advanced_detector = None
+        self.advanced_config = None
+        self.behavior_detector = None
+        self.live_metrics = None  # Always initialize to None
+        
+        if ADVANCED_BEHAVIOR_AVAILABLE:
+            # Advanced configuration with arena mapping
+            self.advanced_config = AdvancedBehaviorConfig(
+                target_line='right',           # Screen on right edge
+                near_max=0.20,                 # Within 20% = near
+                middle_max=0.30,               # 20-30% = middle buffer
+                advance_threshold=0.002,       # Approach sensitivity
+                retreat_threshold=0.002,       # Retreat sensitivity
+                x_dir_thresh_norm=0.01,        # X-axis movement (1% of width)
+                y_dir_thresh_norm=0.01,        # Y-axis movement (1% of height)
+                head_only_thresh_norm=0.005,   # Head wiggle (0.5% of diagonal)
+                body_move_thresh_norm=0.010,   # Locomotion (1% of diagonal)
+                lookback_window=5,             # 5-frame lookback for missing detections
+            )
+            # Initialize LiveMetrics for compatibility (even though advanced detector has its own tracking)
+            self.live_metrics = LiveMetrics()
+            # Note: Advanced detector will be fully initialized after video loads (need frame dimensions)
+            print("✅ Advanced behavioral detector configured (arena mapping enabled)")
+        elif BEHAVIOR_ANALYSIS_AVAILABLE:
+            # Fallback to simple behavioral detector
             config = BehaviorConfig(
-                min_moving_frames=3,      # Need 3+ consecutive frames to declare moving
-                stop_threshold=300.0,      # 300px threshold for movement detection
-                min_stationary_frames=3   # Need 5+ frames to declare stationary
+                min_moving_frames=3,
+                stop_threshold=300.0,
+                min_stationary_frames=3
             )
             self.behavior_detector = BehaviorDetector(config)
-            self.live_metrics = LiveMetrics()  # Initialize LiveMetrics for comprehensive tracking
-            print("✅ Behavioral detector initialized with trajectory-based movement detection + LiveMetrics")
+            self.live_metrics = LiveMetrics()
+            print("✅ Simple behavioral detector initialized")
         else:
-            self.behavior_detector = None
-            self.live_metrics = None
-            print("⚠️ Using simple behavioral events (no trajectory analysis)")
+            print("⚠️ No behavioral analysis available")
         
         # Store behavioral events (newest first)
         self.behavioral_events = []
@@ -207,6 +254,21 @@ class SimpleHeadPoseDetector:
                 
             self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
             self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 15
+            
+            # Get frame dimensions for advanced detector
+            frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            # Initialize advanced behavioral detector now that we have frame dimensions
+            if ADVANCED_BEHAVIOR_AVAILABLE and self.advanced_config:
+                self.advanced_detector = AdvancedBehavioralDetector(
+                    config=self.advanced_config,
+                    frame_width=frame_width,
+                    frame_height=frame_height,
+                    fps=self.fps
+                )
+                print(f"✅ Advanced detector initialized: {frame_width}x{frame_height} @ {self.fps} FPS")
+            
             print(f"✅ Video loaded: {self.total_frames} frames at {self.fps} FPS")
             return True
         except Exception as e:
@@ -343,58 +405,104 @@ class SimpleHeadPoseDetector:
             return frame, []
     
     def process_behavioral_detection(self, results, frame):
-        """Process detection results for trajectory-based behavioral analysis + LiveMetrics"""
-        if not self.behavior_detector or not results or len(results) == 0:
+        """Process detection with ADVANCED behavioral analysis (arena mapping, instruction grammar)"""
+        if not results or len(results) == 0:
+            # Process frame with no detection (lookback will handle)
+            if self.advanced_detector:
+                instruction = self.advanced_detector.process_frame(
+                    frame_idx=self.current_frame_number,
+                    nose=None,
+                    ear_left=None,
+                    ear_right=None,
+                    bbox=None
+                )
             return
         
         try:
-            # Extract position from first detection
-            boxes = results[0].boxes
+            # Extract detection data from YOLO results
+            result = results[0]
+            boxes = result.boxes
+            keypoints = result.keypoints if hasattr(result, 'keypoints') else None
+            
+            nose, ear_left, ear_right, bbox = None, None, None, None
+            
             if boxes is not None and len(boxes) > 0:
-                # Get center position of first detection
+                # Get bounding box
                 box = boxes[0]
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                center_x = int((x1 + x2) / 2)
-                center_y = int((y1 + y2) / 2)
+                xyxy = box.xyxy[0].cpu().numpy()
+                bbox = tuple(xyxy)  # numpy array already contains floats
                 
-                # Update LiveMetrics with position (tracks speed, distance, etc.)
-                if self.live_metrics:
-                    # Use rightmost screen position as reference point for distance calculation
-                    reference_point = (800, 300)  # Rightmost edge center
+                # Extract keypoints
+                if keypoints is not None and len(keypoints.xy) > 0:
+                    kpts = keypoints.xy[0].cpu().numpy()
+                    if len(kpts) >= 3:
+                        # Map keypoints: kpt0=ear_left, kpt1=ear_right, kpt2=nose
+                        if kpts[2][0] > 0 and kpts[2][1] > 0:
+                            nose = tuple(kpts[2])
+                        if kpts[0][0] > 0 and kpts[0][1] > 0:
+                            ear_left = tuple(kpts[0])
+                        if kpts[1][0] > 0 and kpts[1][1] > 0:
+                            ear_right = tuple(kpts[1])
+                
+                # Process with ADVANCED detector
+                if self.advanced_detector:
+                    instruction = self.advanced_detector.process_frame(
+                        frame_idx=self.current_frame_number,
+                        nose=nose,
+                        ear_left=ear_left,
+                        ear_right=ear_right,
+                        bbox=bbox
+                    )
+                    
+                    # Add behavioral event with new instruction format
+                    if instruction:
+                        self.add_behavioral_event(
+                            instruction.phase,  # 'approaching', 'retreating', or 'resting'
+                            instruction.instruction  # Full instruction string
+                        )
+                        print(f"📍 {instruction.instruction}")
+                
+                # Update LiveMetrics (legacy, for compatibility)
+                if hasattr(self, 'live_metrics') and self.live_metrics and bbox:
+                    center_x = (bbox[0] + bbox[2]) / 2
+                    center_y = (bbox[1] + bbox[3]) / 2
+                    reference_point = (800, 300)
                     self.live_metrics.update_position((center_x, center_y), reference_point)
                 
-                # Get video timestamp
-                video_timestamp = self.current_frame_number / self.fps
-                
-                # Process frame with behavioral detector (trajectory-based analysis)
-                events = self.behavior_detector.process_frame(
-                    position=(center_x, center_y),
-                    frame_number=self.current_frame_number
-                )
-                
-                # Update event count in metrics
-                if self.live_metrics and events:
-                    self.live_metrics.events_detected += len(events)
-                
-                # Add behavioral events for movement detection
-                for event in events:
-                    if event.event_type == EventType.STOP_START:
-                        position_desc = self.get_position_description(center_x, center_y)
-                        self.add_behavioral_event(
-                            "movement", 
-                            f"moving to {position_desc} (video: {video_timestamp:.1f}s)"
-                        )
-                        print(f"ℹ️ Movement STARTED to ({center_x}, {center_y}) - {position_desc}")
-                    elif event.event_type == EventType.STOP_END:
-                        position_desc = self.get_position_description(center_x, center_y)
-                        self.add_behavioral_event(
-                            "stationary", 
-                            f"Stationary at {position_desc} (video: {video_timestamp:.1f}s)"
-                        )
-                        print(f"ℹ️ Now STATIONARY at ({center_x}, {center_y}) - {position_desc}")
+                # Log detailed trajectory data for CSV export
+                if nose and bbox:
+                    elapsed_sec = time.time() - self.start_time
+                    timestamp_ms = self.current_frame_number * (1000.0 / self.fps) if self.fps > 0 else 0
+                    conf = result.boxes[0].conf[0].item() if hasattr(result.boxes[0], 'conf') else 0.0
+                    
+                    # Calculate distance from right edge (screen position)
+                    frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) if self.cap else 800
+                    distance_from_edge = frame_width - nose[0]
+                    
+                    # Get speed from LiveMetrics
+                    speed = self.live_metrics.current_speed_px_per_frame if self.live_metrics else 0.0
+                    
+                    # Get current event type from instruction
+                    event_type = instruction.phase if instruction else ''
+                    event_name = instruction.instruction if instruction else ''
+                    
+                    self.trajectory_log.append({
+                        'frame': self.current_frame_number,
+                        'timestamp': timestamp_ms,
+                        'elapsed_sec': elapsed_sec,
+                        'head_x': nose[0],
+                        'head_y': nose[1],
+                        'confidence': conf,
+                        'distance_from_edge': distance_from_edge,
+                        'speed_px_per_frame': speed,
+                        'event_type': event_type,
+                        'event_name': event_name
+                    })
                         
         except Exception as e:
             print(f"❌ Behavioral detection error: {e}")
+            import traceback
+            traceback.print_exc()
     
     def get_position_description(self, x, y):
         """Get position description based on screen at rightmost of frame"""
@@ -519,8 +627,8 @@ class SimpleHeadPoseDetector:
                 # Get first (best) detection
                 box = boxes[0]
                 xyxy = box.xyxy[0].cpu().numpy()
-                x1, y1, x2, y2 = float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3])
-                conf = float(box.conf[0]) if hasattr(box, 'conf') and len(box.conf) > 0 else 0.0
+                x1, y1, x2, y2 = xyxy  # numpy array already contains floats
+                conf = box.conf[0].item() if hasattr(box, 'conf') and len(box.conf) > 0 else 0.0
                 
                 # Create HeadPose object
                 pose = HeadPose(
@@ -539,13 +647,13 @@ class SimpleHeadPoseDetector:
                         
                         # Save nose position (kpt2) - THIS IS WHAT USER WANTS
                         if kpt2[0] > 0 and kpt2[1] > 0:
-                            pose.nose = (float(kpt2[0]), float(kpt2[1]))
+                            pose.nose = tuple(kpt2)
                         
                         # Save ear positions
                         if kpt0[0] > 0 and kpt0[1] > 0:
-                            pose.ear_left = (float(kpt0[0]), float(kpt0[1]))
+                            pose.ear_left = tuple(kpt0)
                         if kpt1[0] > 0 and kpt1[1] > 0:
-                            pose.ear_right = (float(kpt1[0]), float(kpt1[1]))
+                            pose.ear_right = tuple(kpt1)
         
         # Log detection to CSV (includes nose x,y if available)
         obs = PoseObservation(frame_count, pose)
@@ -559,11 +667,14 @@ class SimpleHeadPoseDetector:
                 frame_name = f"frame{frame_count:08d}.jpg"
                 save_labeled_frame(self.run_dir / "labeled_frames" / frame_name, frame)
             
-            # Save YOLO label
+            # Save YOLO label with keypoints
             label_name = f"frame{frame_count:08d}.txt"
+            # Collect keypoints in order: ear_left, ear_right, nose
+            keypoints = [pose.ear_left, pose.ear_right, pose.nose]
             save_yolo_label_txt(
                 self.run_dir / "labels" / label_name, 
-                0, pose.bbox_xyxy, frame_width, frame_height, pose.conf
+                0, pose.bbox_xyxy, frame_width, frame_height, pose.conf,
+                keypoints=keypoints
             )
     
     def save_metrics_snapshot(self, frame_number):
@@ -638,16 +749,69 @@ class SimpleHeadPoseDetector:
             print(f"   Is stationary: {metrics_dict['is_stationary']}")
             print(f"   Direction stability: {metrics_dict['direction_stability']:.2f}")
         
+        # Save detailed trajectory log to CSV
+        if self.run_dir and self.trajectory_log:
+            trajectory_csv = self.run_dir / "trajectory.csv"
+            print(f"\n📊 Saving detailed trajectory data ({len(self.trajectory_log)} frames)...")
+            
+            with open(trajectory_csv, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=[
+                    'frame', 'timestamp', 'elapsed_sec', 'head_x', 'head_y', 
+                    'confidence', 'distance_from_edge', 'speed_px_per_frame', 
+                    'event_type', 'event_name'
+                ])
+                writer.writeheader()
+                writer.writerows(self.trajectory_log)
+            
+            print(f"📝 Trajectory CSV saved to: {trajectory_csv}")
+        
+        # Save ADVANCED behavioral analysis outputs
+        if self.run_dir and self.advanced_detector:
+            print(f"\n🎯 ADVANCED BEHAVIORAL ANALYSIS:")
+            print(f"   Generated {len(self.advanced_detector.instructions)} instructions")
+            
+            # Save behavioral instructions CSV
+            events_csv = self.run_dir / "behavioral_instructions.csv"
+            save_events_csv(
+                self.advanced_detector.get_instructions_csv_format(),
+                events_csv
+            )
+            print(f"📝 Behavioral instructions saved to: {events_csv}")
+            
+            # Create interactive nose-heading map
+            if hasattr(self, 'cap') and self.cap:
+                frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            else:
+                frame_width, frame_height = 800, 600
+            
+            plot_html = self.run_dir / "nose_heading_map.html"
+            video_name = Path(self.video_path).stem
+            
+            create_nose_heading_map(
+                plot_data=self.advanced_detector.get_plot_data(),
+                video_name=video_name,
+                output_path=plot_html,
+                config=self.advanced_config,
+                frame_width=frame_width,
+                frame_height=frame_height
+            )
+            print(f"📈 Interactive plot saved to: {plot_html}")
+        
         if self.run_dir:
-            print(f"✅ Processing complete!")
+            print(f"\n✅ Processing complete!")
             print(f"📊 Total detections: {self.detection_count}")
             print(f"📁 Results saved to: {self.run_dir}")
     
     def stop_detection(self):
-        """Stop detection"""
+        """Stop detection and save all outputs"""
         self.running = False
         if hasattr(self, 'detection_thread'):
             self.detection_thread.join(timeout=2)
+        
+        # Save all trajectory data and plots before closing
+        self.cleanup_files()
+        
         if self.cap:
             self.cap.release()
         self.add_behavioral_event("system", "Detection stopped")
@@ -826,7 +990,7 @@ HTML_TEMPLATE = """
                 </div>
                 
                 <div class="behavioral-log">
-                    <h3>🎯 Behavioral Events (Newest First)</h3>
+                    <h3>🎯 Behavioral Events</h3>
                     <div id="behavioral-events">
                         <p>No events yet...</p>
                     </div>
