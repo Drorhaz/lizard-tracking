@@ -11,8 +11,8 @@ class BehaviorConfig:
     # Distance thresholds (pixels, since no calibration by default)
     close_distance_px: float = 200.0      # Pixels considered "close to screen/target"
     far_distance_px: float = 600.0        # Pixels considered "far from screen/target" 
-    approach_threshold_px: float = 50.0   # Distance threshold for detecting approach
-    retreat_threshold_px: float = 50.0    # Distance threshold for detecting retreat
+    approach_threshold_px: float = 300.0   # Distance threshold for detecting approach
+    retreat_threshold_px: float = 300.0    # Distance threshold for detecting retreat
     approach_threshold: float = 200.0     # Alias - distance to consider "approaching"
     retreat_threshold: float = 400.0      # Alias - distance to consider "retreating"
     hysteresis_px: float = 10.0           # Hysteresis band to prevent flickering events
@@ -30,8 +30,8 @@ class BehaviorConfig:
     detect_stop: bool = True
     detect_close_to_target: bool = True
     detect_far_from_target: bool = True
-    detect_fast_movement: bool = False
-    detect_direction_change: bool = False
+    detect_fast_movement: bool = True
+    detect_direction_change: bool = True
     
     # Event thresholds
     fast_movement_threshold_px: float = 100.0  # Speed considered "fast"
