@@ -28,6 +28,11 @@ from .detector import BehaviorDetector
 from .config import BehaviorConfig
 from .events import BehaviorEvent, EventBus, EventType
 from .metrics import LiveMetrics
+
+# Advanced trajectory analysis with arena mapping
+from .config_advanced import AdvancedBehaviorConfig
+from .detector_advanced import AdvancedBehavioralDetector, BehavioralInstruction, DetectionFrame
+from .plotter import create_nose_heading_map, save_trajectory_csv, save_events_csv
 from .export import BehaviorExporter
 from .trajectory import TrajectoryAnalyzer, TrajectoryPoint
 
