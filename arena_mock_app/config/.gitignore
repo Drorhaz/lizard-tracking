@@ -1,0 +1,5 @@
+# Ignore actual configuration file (contains system-specific paths)
+.env
+
+# Keep the example file
+!.env.example
