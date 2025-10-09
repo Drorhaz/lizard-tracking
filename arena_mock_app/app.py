@@ -29,6 +29,8 @@ import torch
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from dotenv import load_dotenv
+import queue
+from collections import deque
 
 # Add the lib directory to the path for imports
 import sys
@@ -100,6 +102,8 @@ class AppConfig:
         self.save_every_n_frames = int(os.getenv('SAVE_EVERY_N_FRAMES', '10'))
         self.save_every_n_previews = int(os.getenv('SAVE_EVERY_N_PREVIEWS', '30'))
         self.verbose = os.getenv('VERBOSE', 'false').lower() == 'true'
+        self.detection_iou = float(os.getenv('DETECTION_IOU', '0.5'))
+        self.detection_imgsz = int(os.getenv('DETECTION_IMGSZ', '640'))
         
         # Advanced Behavioral Analysis
         self.target_line = os.getenv('TARGET_LINE', 'right')
@@ -124,6 +128,13 @@ class AppConfig:
         self.server_debug = os.getenv('SERVER_DEBUG', 'false').lower() == 'true'
         self.stream_fps = int(os.getenv('STREAM_FPS', '15'))
         self.jpeg_quality = int(os.getenv('JPEG_QUALITY', '85'))
+        self.use_predict_stream = os.getenv('USE_PREDICT_STREAM', 'false').lower() == 'true'
+        self.overlay_event_seconds = float(os.getenv('OVERLAY_EVENT_SECONDS', '2.5'))
+        self.frame_queue_size = int(os.getenv('FRAME_QUEUE_SIZE', '2'))
+        
+        # Video saving with overlays
+        self.save_video_with_overlays = os.getenv('SAVE_VIDEO_WITH_OVERLAYS', 'false').lower() == 'true'
+        self.output_video_fps = float(os.getenv('OUTPUT_VIDEO_FPS', '15.0'))
     
     def print_config(self):
         """Print current configuration"""
@@ -138,6 +149,9 @@ class AppConfig:
         print(f"🔊 Verbose: {self.verbose}")
         print(f"🌐 Server: {self.server_host}:{self.server_port}")
         print(f"📺 Stream FPS: {self.stream_fps}")
+        print(f"🎬 Save Video with Overlays: {self.save_video_with_overlays}")
+        if self.save_video_with_overlays:
+            print(f"📼 Output Video FPS: {self.output_video_fps}")
         print("="*60 + "\n")
 
 # Initialize global configuration
@@ -250,11 +264,32 @@ class SimpleHeadPoseDetector:
         self.frame_lock = threading.Lock()
         self.current_frame_number = 0
         self.total_frames = 0
-        self.fps = config.processing_fps
+        # Target processing FPS (can differ from source capture FPS)
+        self.processing_target_fps = config.processing_fps
+        self.fps = self.processing_target_fps  # Backward compatibility for existing references
         self.detection_count = 0
+        self.frame_queue = queue.Queue(maxsize=self.config.frame_queue_size)
+        self.latest_raw_frame = None
+        self.latest_processed_frame = None
+        self.latest_raw_frame_time = 0.0
+        self.latest_processed_frame_time = 0.0
+        self.capture_fps = 0.0
+        self.video_fps = 0.0
+        self.capture_time_log = deque(maxlen=120)
+        self.detection_time_log = deque(maxlen=120)
+        self.stream_time_log = deque(maxlen=120)
+        self.last_event_overlay = None
+        self.last_event_time = 0.0
+        self.frame_reader_thread = None
+        self.detection_thread = None
+        self.stream_target_fps = config.stream_fps
+        self.detection_iou = config.detection_iou
+        self.detection_imgsz = config.detection_imgsz
         
         # Control verbosity from config
         self.verbose = config.verbose
+        self.use_predict_stream = config.use_predict_stream
+        self.overlay_event_seconds = config.overlay_event_seconds
         
         # Trajectory logging for detailed CSV export
         self.trajectory_log = []  # Store detailed per-frame data
@@ -312,6 +347,12 @@ class SimpleHeadPoseDetector:
         self.save_every_n_frames = config.save_every_n_frames
         self.save_every_n_previews = config.save_every_n_previews
         
+        # Video saving with overlays 
+        self.save_video_with_overlays = config.save_video_with_overlays
+        self.output_video_fps = config.output_video_fps
+        self.video_writer = None
+        self.output_video_path = None
+        
     def load_model(self):
         """Load YOLO model"""
         try:
@@ -337,11 +378,22 @@ class SimpleHeadPoseDetector:
                 return False
                 
             self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 15
+            self.capture_fps = self.cap.get(cv2.CAP_PROP_FPS) or 0.0
+            if self.capture_fps <= 0:
+                fallback_fps = self.processing_target_fps if self.processing_target_fps > 0 else 15.0
+                self.capture_fps = fallback_fps
+            self.video_fps = self.capture_fps
+            
+            if self.processing_target_fps <= 0:
+                self.processing_target_fps = self.capture_fps
+            self.fps = self.processing_target_fps
             
             # Get frame dimensions for advanced detector
             frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self.frame_width = frame_width
+            self.frame_height = frame_height
+            self.video_fps = self.fps
             
             # Initialize advanced behavioral detector now that we have frame dimensions
             if ADVANCED_BEHAVIOR_AVAILABLE and self.advanced_config:
@@ -349,11 +401,11 @@ class SimpleHeadPoseDetector:
                     config=self.advanced_config,
                     frame_width=frame_width,
                     frame_height=frame_height,
-                    fps=self.fps
+                    fps=self.capture_fps
                 )
-                print(f"✅ Advanced detector initialized: {frame_width}x{frame_height} @ {self.fps} FPS")
+                print(f"✅ Advanced detector initialized: {frame_width}x{frame_height} @ {self.capture_fps:.1f} FPS")
             
-            print(f"✅ Video loaded: {self.total_frames} frames at {self.fps} FPS")
+            print(f"✅ Video loaded: {self.total_frames} frames at {self.capture_fps:.1f} FPS")
             return True
         except Exception as e:
             print(f"❌ Video loading failed: {e}")
@@ -362,13 +414,21 @@ class SimpleHeadPoseDetector:
     def add_behavioral_event(self, event_type, description):
         """Add behavioral event to the list (newest first)"""
         current_time = datetime.now().strftime("%H:%M:%S")
-        video_second = round(self.current_frame_number / self.fps, 1)
+        fps_for_time = self.video_fps or self.capture_fps or self.processing_target_fps or 1.0
+        video_second = round(self.current_frame_number / fps_for_time, 1)
         
+        description_ascii = (description
+                              .replace("→", "->")
+                              .replace("←", "<-")
+                              .replace("—", "-")
+                              .replace("–", "-")
+                              .replace("•", "*")
+                              )
         event = {
             "time": current_time,
             "video_second": video_second,
             "type": event_type,
-            "description": description
+            "description": description_ascii
         }
         
         with self.events_lock:
@@ -418,20 +478,36 @@ class SimpleHeadPoseDetector:
         return frame
     
     def detect_poses(self, frame):
-        """Optimized pose detection for live streaming"""
+        """Run YOLO detection on the provided frame and draw overlays"""
         if self.model is None:
             return frame, []
         
         try:
-            # Run detection with EXACT same params as offline video_pose_pipeline.py
-            results = self.model(
-                frame, 
-                verbose=False, 
-                conf=self.CONFIDENCE_THRESHOLD,
-                iou=0.5,  # Match offline (was 0.7, too aggressive)
-                imgsz=640,  # CRITICAL: Resize to 640x640 like offline!
-                device='cuda' if torch.cuda.is_available() else 'cpu'
-            )
+            device_target = 'cuda' if torch.cuda.is_available() else 'cpu'
+            detect_iou = self.detection_iou
+            detect_imgsz = self.detection_imgsz
+            if self.use_predict_stream:
+                results_iter = self.model.predict(
+                    frame,
+                    stream=True,
+                    verbose=False,
+                    conf=self.CONFIDENCE_THRESHOLD,
+                    iou=detect_iou,
+                    imgsz=detect_imgsz,
+                    device=device_target
+                )
+                results = list(results_iter)
+            else:
+                results = self.model(
+                    frame, 
+                    verbose=False, 
+                    conf=self.CONFIDENCE_THRESHOLD,
+                    iou=detect_iou,  # Match offline defaults
+                    imgsz=detect_imgsz,
+                    device=device_target
+                )
+                if not isinstance(results, list):
+                    results = [results]
             
             if results and len(results) > 0:
                 self.detection_count += 1
@@ -485,9 +561,6 @@ class SimpleHeadPoseDetector:
                 else:
                     frame = self.draw_simple_detection(frame, results)
                 
-                # Process behavioral analysis for trajectory-based movement detection
-                self.process_behavioral_detection(results, frame)
-                
                 # Add simple detection event occasionally
                 if self.detection_count % 30 == 1:  # Every ~2 seconds at 15fps
                     self.add_behavioral_event("detection", f"Head detected (conf: {self.CONFIDENCE_THRESHOLD})")
@@ -504,6 +577,7 @@ class SimpleHeadPoseDetector:
     
     def process_behavioral_detection(self, results, frame):
         """Process detection with ADVANCED behavioral analysis (arena mapping, instruction grammar)"""
+        instruction = None
         if not results or len(results) == 0:
             # Process frame with no detection (lookback will handle)
             if self.advanced_detector:
@@ -514,7 +588,7 @@ class SimpleHeadPoseDetector:
                     ear_right=None,
                     bbox=None
                 )
-            return
+            return instruction
         
         try:
             # Extract detection data from YOLO results
@@ -571,7 +645,8 @@ class SimpleHeadPoseDetector:
                 # Log detailed trajectory data for CSV export
                 if nose and bbox:
                     elapsed_sec = time.time() - self.start_time
-                    timestamp_ms = self.current_frame_number * (1000.0 / self.fps) if self.fps > 0 else 0
+                    fps_for_time = self.video_fps or self.capture_fps or self.processing_target_fps
+                    timestamp_ms = self.current_frame_number * (1000.0 / fps_for_time) if fps_for_time and fps_for_time > 0 else 0
                     conf = result.boxes[0].conf[0].item() if hasattr(result.boxes[0], 'conf') else 0.0
                     
                     # Calculate distance from right edge (screen position)
@@ -602,6 +677,8 @@ class SimpleHeadPoseDetector:
             print(f"❌ Behavioral detection error: {e}")
             import traceback
             traceback.print_exc()
+        
+        return instruction
     
     def get_position_description(self, x, y):
         """Get position description based on screen at rightmost of frame"""
@@ -622,12 +699,130 @@ class SimpleHeadPoseDetector:
         
         return f"{horizontal}-{vertical}"
     
+    def _compute_fps(self, time_log: deque) -> float:
+        """Compute rolling FPS based on timestamps in deque"""
+        if len(time_log) < 2:
+            return 0.0
+        duration = time_log[-1] - time_log[0]
+        if duration <= 0:
+            return 0.0
+        return (len(time_log) - 1) / duration
+    
+    def _record_capture_timestamp(self):
+        self.capture_time_log.append(time.time())
+    
+    def _record_detection_timestamp(self):
+        self.detection_time_log.append(time.time())
+    
+    def _record_stream_timestamp(self):
+        self.stream_time_log.append(time.time())
+    
+    def _get_event_overlay_text(self) -> Optional[str]:
+        """Return event text for overlay if still fresh"""
+        if not self.last_event_overlay:
+            return None
+        if (time.time() - self.last_event_time) > self.overlay_event_seconds:
+            self.last_event_overlay = None
+            return None
+        return self.last_event_overlay
+    
+    def _handle_detection_output(self, frame_index: int, clean_frame: np.ndarray, frame_with_detection: np.ndarray,
+                                 results, frame_width: int, frame_height: int, video_fps: float,
+                                 detection_start_time: float):
+        """Common post-processing for a detected frame (behavior, overlays, saving, metrics)."""
+        instruction = self.process_behavioral_detection(results, clean_frame)
+        self._record_detection_timestamp()
+        
+        if instruction:
+            overlay_text = f"{instruction.phase.upper()}: {instruction.instruction}"
+            overlay_text_ascii = (overlay_text
+                                   .replace("→", "->")
+                                   .replace("←", "<-")
+                                   .replace("—", "-")
+                                   .replace("–", "-")
+                                   .replace("•", "*")
+                                   )
+            self.last_event_overlay = overlay_text_ascii
+            self.last_event_time = time.time()
+            self.last_detected = overlay_text_ascii
+        elif results:
+            # Ensure periodic detection updates even without behavioral instructions
+            if self.detection_count % 10 == 1:
+                primary_conf = None
+                try:
+                    first_result = results[0]
+                    if hasattr(first_result, 'boxes') and first_result.boxes is not None and len(first_result.boxes) > 0:
+                        primary_conf = float(first_result.boxes[0].conf[0])
+                except Exception:
+                    primary_conf = None
+                conf_text = f"{primary_conf:.2f}" if primary_conf is not None else f"< {self.CONFIDENCE_THRESHOLD:.2f}"
+                self.add_behavioral_event("detection", f"Head detected (conf: {conf_text})")
+                last_detection = self.last_detected
+                self.last_event_overlay = f"DETECTION: conf {conf_text}. Last detection: {last_detection}"
+                self.last_event_time = time.time()
+        
+        # Always show status overlay in yellow at bottom-left
+        event_overlay = self._get_event_overlay_text()
+        if event_overlay:
+            status_text = event_overlay
+        else:
+            # Fallback status when no behavioral events
+            status_text = f"MONITORING | Frame: {frame_index} | Conf: >{self.CONFIDENCE_THRESHOLD:.2f}"
+        
+        # Clean up text for display
+        safe_overlay = status_text.replace("→", "->").replace("←", "<-")
+        cv2.putText(frame_with_detection, safe_overlay, (10, frame_height - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (50, 220, 255), 2)
+        
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        fps_for_display = self.video_fps or video_fps or self.capture_fps or self.processing_target_fps or 1.0
+        video_time = f"Video: {frame_index / fps_for_display:.1f}s"
+        cv2.putText(frame_with_detection, timestamp, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(frame_with_detection, video_time, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        # Overlay real-time FPS metrics
+        detection_fps = self._compute_fps(self.detection_time_log)
+        capture_fps = self._compute_fps(self.capture_time_log) or self.capture_fps
+        # fps_text = f"Detect FPS: {detection_fps:.1f} | Capture FPS: {capture_fps:.1f}"
+        # cv2.putText(frame_with_detection, fps_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 200), 2)
+        
+        # Save detection artifacts and metrics
+        frame_count = frame_index + 1
+        self.save_detection_data(results, frame_count, frame_width, frame_height, video_fps, clean_frame, frame_with_detection)
+        self.save_metrics_snapshot(frame_count)
+        
+        with self.frame_lock:
+            self.latest_processed_frame = frame_with_detection
+            self.latest_frame = frame_with_detection
+            self.latest_processed_frame_time = time.time()
+        
+        # Save frame to video with overlays if enabled
+        if self.save_video_with_overlays and self.video_writer is not None:
+            self.video_writer.write(frame_with_detection)
+        
+        detection_duration = time.time() - detection_start_time
+        if self.verbose:
+            print(f"⏱️ Detection frame {frame_index} took {detection_duration*1000:.1f} ms")
+    
     def start_detection(self):
         """Start the detection process"""
         if not self.load_model() or not self.load_video():
             return False
         
         self.running = True
+        self.fps = self.processing_target_fps  # maintain legacy attribute for target processing FPS
+        self.frame_queue = queue.Queue(maxsize=self.config.frame_queue_size)
+        self.capture_time_log.clear()
+        self.detection_time_log.clear()
+        self.stream_time_log.clear()
+        self.last_event_overlay = None
+        self.last_detected = None
+        self.last_event_time = 0.0
+        self.latest_processed_frame = None
+        self.latest_frame = None
+        self.latest_raw_frame = None
+        self.latest_processed_frame_time = 0.0
+        self.latest_raw_frame_time = 0.0
         print("🎬 Detection started")
         
         # Setup file organization (from video_pose_pipeline.py)
@@ -636,55 +831,89 @@ class SimpleHeadPoseDetector:
         # Add initial event
         self.add_behavioral_event("system", "Detection started")
         
-        def detection_loop():
-            frame_count = 0
-            frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            video_fps = self.cap.get(cv2.CAP_PROP_FPS) or 25.0
-            
+        target_fps_for_capture = self.capture_fps if self.capture_fps and self.capture_fps > 0 else self.processing_target_fps
+        if not target_fps_for_capture or target_fps_for_capture <= 0:
+            target_fps_for_capture = self.processing_target_fps if self.processing_target_fps > 0 else self.capture_fps
+        if target_fps_for_capture and self.capture_fps and target_fps_for_capture > self.capture_fps:
+            # Avoid racing ahead of the actual video frame rate to keep motion smooth
+            target_fps_for_capture = self.capture_fps
+        frame_interval = 1.0 / target_fps_for_capture if target_fps_for_capture and target_fps_for_capture > 0 else 0.0
+        
+        def frame_reader_loop():
+            frame_index = 0
+            next_frame_time = time.time()
             while self.running:
                 ret, frame = self.cap.read()
                 if not ret:
-                    # End of video - stop detection
                     print("📹 End of video reached")
                     self.running = False
                     break
                 
-                self.current_frame_number = frame_count
-                frame_count += 1
-                
-                # Keep CLEAN frame (no drawings) for saving with labels
                 clean_frame = frame.copy()
-                
-                # CRITICAL: Detect on CLEAN frame BEFORE any overlays!
-                # Overlays degrade accuracy because model was trained on clean frames
-                frame, results = self.detect_poses(frame)
-                
-                # Add timestamp overlay AFTER detection (for preview/streaming)
-                timestamp = datetime.now().strftime("%H:%M:%S")
-                video_time = f"Video: {self.current_frame_number/self.fps:.1f}s"
-                cv2.putText(frame, timestamp, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                cv2.putText(frame, video_time, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                
-                # Save detection data with CLEAN frame and DRAWN preview
-                self.save_detection_data(results, frame_count, frame_width, frame_height, video_fps, clean_frame, frame)
-                
-                # Save metrics snapshot periodically
-                self.save_metrics_snapshot(frame_count)
-                
-                # Store latest frame (only copy after all processing is done)
                 with self.frame_lock:
-                    self.latest_frame = frame
+                    self.latest_raw_frame = clean_frame
+                    self.latest_raw_frame_time = time.time()
                 
-                # Pace detection to match video's framerate for real-time playback
-                # This ensures video plays at natural speed (e.g., 10 FPS video takes real time)
-                time.sleep(1.0 / self.fps)
+                self._record_capture_timestamp()
+                
+                try:
+                    while self.frame_queue.full():
+                        self.frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                
+                try:
+                    self.frame_queue.put_nowait((clean_frame, frame_index))
+                except queue.Full:
+                    if self.verbose:
+                        print("⚠️ Frame queue full, dropping frame")
+                
+                frame_index += 1
+                
+                if frame_interval > 0:
+                    next_frame_time += frame_interval
+                    sleep_time = next_frame_time - time.time()
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
             
-            # Cleanup on end
-            self.cleanup_files()
+            # Signal detection loop to exit
+            try:
+                self.frame_queue.put_nowait((None, None))
+            except queue.Full:
+                try:
+                    self.frame_queue.get_nowait()
+                    self.frame_queue.put_nowait((None, None))
+                except Exception:
+                    pass
         
-        # Start detection in background thread
-        self.detection_thread = threading.Thread(target=detection_loop, daemon=True)
+        def detection_loop():
+            frame_width = getattr(self, 'frame_width', None) or int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_height = getattr(self, 'frame_height', None) or int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            video_fps = getattr(self, 'video_fps', None) or (self.cap.get(cv2.CAP_PROP_FPS) or 25.0)
+            
+            try:
+                while self.running or not self.frame_queue.empty():
+                    try:
+                        clean_frame, frame_index = self.frame_queue.get(timeout=0.5)
+                    except queue.Empty:
+                        continue
+                    
+                    if clean_frame is None:
+                        break
+                    
+                    self.current_frame_number = frame_index
+                    frame_for_detection = clean_frame.copy()
+                    detection_start = time.time()
+                    frame_with_detection, results = self.detect_poses(frame_for_detection)
+                    self._handle_detection_output(frame_index, clean_frame, frame_with_detection, results,
+                                                   frame_width, frame_height, video_fps, detection_start)
+            finally:
+                self.cleanup_files()
+        
+        # Start frame reader and detection threads
+        self.frame_reader_thread = threading.Thread(target=frame_reader_loop, daemon=True, name="FrameReader")
+        self.frame_reader_thread.start()
+        self.detection_thread = threading.Thread(target=detection_loop, daemon=True, name="DetectionWorker")
         self.detection_thread.start()
         return True
     
@@ -698,7 +927,9 @@ class SimpleHeadPoseDetector:
             "video_path": self.video_path,
             "model_path": self.model_path,
             "confidence_threshold": self.CONFIDENCE_THRESHOLD,
-            "fps": self.fps,
+            "fps": self.processing_target_fps,
+            "capture_fps": self.capture_fps,
+            "stream_fps": self.stream_target_fps,
             "device": "GPU (CUDA)" if torch.cuda.is_available() else "CPU",
             "timestamp": now_tag(),
             "total_frames": self.total_frames
@@ -713,6 +944,18 @@ class SimpleHeadPoseDetector:
         
         print(f"📁 Output directory: {self.run_dir}")
         print(f"📊 CSV file: {csv_path}")
+        
+        # Initialize video writer if enabled
+        if self.save_video_with_overlays:
+            self.output_video_path = self.run_dir / "processed_video_with_overlays.mp4"
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self.video_writer = cv2.VideoWriter(
+                str(self.output_video_path),
+                fourcc,
+                self.output_video_fps,
+                (self.frame_width, self.frame_height)
+            )
+            print(f"🎬 Video with overlays will be saved to: {self.output_video_path}")
     
     def save_detection_data(self, results, frame_count, frame_width, frame_height, video_fps, clean_frame, drawn_frame):
         """Save detection data: CSV + clean frames + labels + preview frames"""
@@ -826,6 +1069,13 @@ class SimpleHeadPoseDetector:
             self.csv_file.close()
             self.csv_file = None
         
+        # Close video writer
+        if self.video_writer is not None:
+            self.video_writer.release()
+            self.video_writer = None
+            if self.output_video_path:
+                print(f"🎬 Video with overlays saved to: {self.output_video_path}")
+        
         # Save LiveMetrics summary
         if self.run_dir and self.live_metrics:
             metrics_dict = self.live_metrics.to_dict()
@@ -918,11 +1168,18 @@ class SimpleHeadPoseDetector:
     def stop_detection(self):
         """Stop detection and save all outputs"""
         self.running = False
-        if hasattr(self, 'detection_thread'):
-            self.detection_thread.join(timeout=2)
         
-        # Save all trajectory data and plots before closing
-        self.cleanup_files()
+        try:
+            if self.frame_queue:
+                self.frame_queue.put_nowait((None, None))
+        except Exception:
+            pass
+        
+        if hasattr(self, 'frame_reader_thread') and self.frame_reader_thread:
+            self.frame_reader_thread.join(timeout=2)
+        
+        if hasattr(self, 'detection_thread') and self.detection_thread:
+            self.detection_thread.join(timeout=4)
         
         if self.cap:
             self.cap.release()
@@ -930,23 +1187,51 @@ class SimpleHeadPoseDetector:
     
     def get_latest_frame(self):
         """Get the latest processed frame"""
+        freshness_window = 0.5
+        if self.stream_target_fps > 0:
+            freshness_window = max(freshness_window, 2.0 / self.stream_target_fps)
+        
         with self.frame_lock:
-            if self.latest_frame is not None:
-                return self.latest_frame.copy()
+            processed = self.latest_processed_frame
+            processed_time = self.latest_processed_frame_time
+            raw = self.latest_raw_frame
+        
+        now = time.time()
+        if processed is not None and (now - processed_time) <= freshness_window:
+            return processed.copy()
+        if raw is not None:
+            return raw.copy()
         return None
     
     def get_status(self):
         """Get current detection status"""
         device_info = "GPU (CUDA)" if torch.cuda.is_available() else "CPU"
         memory_info = f"GPU: {torch.cuda.memory_allocated()/1024**2:.0f}MB" if torch.cuda.is_available() else "CPU Mode"
+        capture_fps_measured = self._compute_fps(self.capture_time_log)
+        detection_fps_measured = self._compute_fps(self.detection_time_log)
+        stream_fps_measured = self._compute_fps(self.stream_time_log)
+        
+        if capture_fps_measured <= 0 and self.capture_fps:
+            capture_fps_measured = self.capture_fps
+        if detection_fps_measured < 0:
+            detection_fps_measured = 0.0
+        if stream_fps_measured <= 0 and self.stream_target_fps:
+            stream_fps_measured = self.stream_target_fps
         
         return {
             "running": self.running,
             "device": device_info,
             "memory": memory_info,
-            "fps": self.fps,
+            "fps": self.processing_target_fps,
+            "processing_fps": self.processing_target_fps,
+            "source_fps": self.capture_fps,
+            "stream_target_fps": self.stream_target_fps,
+            "capture_fps": capture_fps_measured,
+            "detection_fps": detection_fps_measured,
+            "stream_fps": stream_fps_measured,
             "confidence_threshold": self.CONFIDENCE_THRESHOLD,
-            "output_dir": str(self.run_dir.resolve()) if self.run_dir else "Not started yet"
+            "output_dir": str(self.run_dir.resolve()) if self.run_dir else "Not started yet",
+            "predict_stream": self.use_predict_stream
         }
     
     def get_behavioral_events(self):
@@ -1184,6 +1469,12 @@ HTML_TEMPLATE = """
                     const statusDiv = document.getElementById('status-info');
                     if (data.running) {
                         const outputDir = data.output_dir || 'Not started yet';
+                        const processingTarget = Number((data.processing_fps ?? data.fps) || 0).toFixed(1);
+                        const streamTarget = Number((data.stream_target_fps ?? data.stream_fps) || 0).toFixed(1);
+                        const sourceFps = Number((data.source_fps ?? data.capture_fps) || 0).toFixed(1);
+                        const captureFps = Number(data.capture_fps || 0).toFixed(1);
+                        const detectFps = Number(data.detection_fps || 0).toFixed(1);
+                        const streamFps = Number(data.stream_fps || 0).toFixed(1);
                         
                         // Create inline status layout
                         statusDiv.innerHTML = `
@@ -1191,8 +1482,14 @@ HTML_TEMPLATE = """
                                 <span>✅ <strong>RUNNING</strong></span>
                                 <span>🖥️ ${data.device || 'Unknown'}</span>
                                 <span>💾 ${data.memory || 'Unknown'}</span>
-                                <span>⚡ FPS: ${data.fps}</span>
+                                <div style="display: flex; flex-direction: column; gap: 4px;">
+                                    <span>⚙️ Processing target: ${processingTarget} fps</span>
+                                    <span>📺 Stream target: ${streamTarget} fps</span>
+                                    <span>🎞️ Source video: ${sourceFps} fps</span>
+                                    <span>🎥 Capture: ${captureFps} | 🧠 Detect: ${detectFps} | 📺 Stream: ${streamFps}</span>
+                                </div>
                                 <span>🔍 Conf: ${data.confidence_threshold}</span>
+                                <span>🛰️ YOLO stream: ${data.predict_stream ? 'ON' : 'OFF'}</span>
                             </div>
                             <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #ddd;">
                                 <div style="font-size: 0.85em; color: #666;">
@@ -1239,6 +1536,9 @@ HTML_TEMPLATE = """
                     }).join('');
                     
                     previousEventCount = data.length;
+                })
+                .catch(error => {
+                    console.error('Error fetching events:', error);
                 });
         }
         
@@ -1246,8 +1546,8 @@ HTML_TEMPLATE = """
         setInterval(() => {
             if (isRunning) {
                 updateStatus();
+                updateEvents();
             }
-            updateEvents();
         }, 1000);
         
         // Initial update
@@ -1265,18 +1565,43 @@ def index():
 @app.route('/video_feed')
 def video_feed():
     def generate_frames():
-        print(f"✅ Video streaming started at {CONFIG.stream_fps} FPS")
+        base_target_fps = CONFIG.stream_fps
+        print(f"✅ Video streaming started at {base_target_fps} FPS")
+        last_target_fps = base_target_fps
+        frame_interval = 1.0 / last_target_fps if last_target_fps > 0 else 0.0
+        next_frame_time = time.time()
         while True:
-            if detector and detector.running:
-                frame = detector.get_latest_frame()
-                if frame is not None:
-                    # Encode frame with configured quality
-                    ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, CONFIG.jpeg_quality])
-                    if ret:
-                        yield (b'--frame\r\n'
-                               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-            # Stream at configured FPS
-            time.sleep(1.0 / CONFIG.stream_fps)
+            frame = None
+            active_detector = detector
+            if active_detector:
+                frame = active_detector.get_latest_frame()
+                current_target_fps = getattr(active_detector, 'stream_target_fps', last_target_fps)
+            else:
+                current_target_fps = base_target_fps
+            
+            if current_target_fps != last_target_fps:
+                last_target_fps = current_target_fps
+                frame_interval = 1.0 / last_target_fps if last_target_fps > 0 else 0.0
+                next_frame_time = time.time()
+            
+            if frame is None:
+                time.sleep(0.01)
+                continue
+            
+            ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, CONFIG.jpeg_quality])
+            if ret:
+                if active_detector:
+                    active_detector._record_stream_timestamp()
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            
+            if frame_interval > 0:
+                next_frame_time += frame_interval
+                sleep_time = next_frame_time - time.time()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+            else:
+                time.sleep(0.001)
     
     return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
