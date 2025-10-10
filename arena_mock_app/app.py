@@ -31,6 +31,7 @@ from typing import Optional, Tuple
 from dotenv import load_dotenv
 import queue
 from collections import deque
+import math
 
 # Add the lib directory to the path for imports
 import sys
@@ -89,6 +90,106 @@ try:
 except ImportError as e:
     print(f"⚠️ Behavioral analysis import failed: {e}")
     BEHAVIOR_ANALYSIS_AVAILABLE = False
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Kalman Filter for Angle Smoothing
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class AngleKalmanFilter:
+    """Kalman filter for smoothing head angle measurements"""
+    
+    def __init__(self, process_noise=1e-5, measurement_noise=1e-2):
+        """
+        Initialize Kalman filter for angle tracking
+        
+        Args:
+            process_noise: Process noise variance (how much we expect the angle to change)
+            measurement_noise: Measurement noise variance (how noisy our angle measurements are)
+        """
+        # State: [angle, angular_velocity]
+        self.x = np.array([0.0, 0.0])  # Initial state (angle=0, velocity=0)
+        
+        # State covariance matrix
+        self.P = np.eye(2) * 1000  # High initial uncertainty
+        
+        # State transition matrix (constant velocity model)
+        self.F = np.array([[1.0, 1.0],  # angle = angle + velocity * dt (dt=1 frame)
+                           [0.0, 1.0]])  # velocity = velocity
+        
+        # Measurement matrix (we only observe angle, not velocity)
+        self.H = np.array([[1.0, 0.0]])
+        
+        # Process noise covariance
+        self.Q = np.array([[process_noise, 0.0],
+                           [0.0, process_noise]])
+        
+        # Measurement noise covariance
+        self.R = np.array([[measurement_noise]])
+        
+        self.initialized = False
+        
+    def update(self, measured_angle):
+        """
+        Update filter with new angle measurement
+        
+        Args:
+            measured_angle: Measured angle in degrees
+            
+        Returns:
+            smoothed_angle: Filtered angle in degrees
+        """
+        if not self.initialized:
+            # Initialize with first measurement
+            self.x[0] = measured_angle
+            self.x[1] = 0.0  # No initial velocity
+            self.initialized = True
+            return measured_angle
+        
+        # Handle angle wraparound (convert to 0-360 range)
+        measured_angle = self._normalize_angle_360(measured_angle)
+        
+        # Handle angle discontinuity (e.g., 359° to 1°)
+        angle_diff = measured_angle - self.x[0]
+        if angle_diff > 180:
+            measured_angle -= 360
+        elif angle_diff < -180:
+            measured_angle += 360
+        
+        # Prediction step
+        self.x = self.F @ self.x  # Predict next state
+        self.P = self.F @ self.P @ self.F.T + self.Q  # Predict covariance
+        
+        # Update step
+        z = np.array([measured_angle])  # Measurement
+        y = z - self.H @ self.x  # Innovation (measurement residual)
+        S = self.H @ self.P @ self.H.T + self.R  # Innovation covariance
+        K = self.P @ self.H.T @ np.linalg.inv(S)  # Kalman gain
+        
+        self.x = self.x + K @ y  # Update state
+        self.P = (np.eye(2) - K @ self.H) @ self.P  # Update covariance
+        
+        # Return smoothed angle normalized to 0-360
+        return self._normalize_angle_360(self.x[0])
+    
+    def _normalize_angle(self, angle):
+        """Normalize angle to [-180, 180] degrees"""
+        while angle > 180:
+            angle -= 360
+        while angle <= -180:
+            angle += 360
+        return angle
+    
+    def _normalize_angle_360(self, angle):
+        """Normalize angle to [0, 360) degrees"""
+        while angle < 0:
+            angle += 360
+        while angle >= 360:
+            angle -= 360
+        return angle
+    
+    def get_angular_velocity(self):
+        """Get estimated angular velocity in degrees per frame"""
+        return self.x[1] if self.initialized else 0.0
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Configuration Management
@@ -206,6 +307,110 @@ class PoseObservation:
 
 CSV_HEADER = ("frame_idx","conf","x1","y1","x2","y2","cx","cy","nose_x","nose_y")
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Angle Calculation Functions
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def calculate_head_angle_to_target(nose, ear_left, ear_right, target_line, target_line_position, frame_width, frame_height):
+    """
+    Calculate the angle of the head relative to the target line (screen)
+    
+    Args:
+        nose: (x, y) coordinates of nose keypoint
+        ear_left: (x, y) coordinates of left ear keypoint
+        ear_right: (x, y) coordinates of right ear keypoint
+        target_line: 'right', 'left', 'top', or 'bottom' - location of screen
+        target_line_position: numerical position of the target line
+        frame_width: width of the frame
+        frame_height: height of the frame
+        
+    Returns:
+        tuple: (angle_degrees, head_direction_vector)
+               angle_degrees: angle in degrees (0-360°)
+                             0° = pointing directly at target
+                             90° = pointing perpendicular to target (counterclockwise)
+                             180° = pointing away from target
+                             270° = pointing perpendicular to target (clockwise)
+               head_direction_vector: (x, y) normalized vector showing head direction
+    """
+    if not nose or (not ear_left and not ear_right):
+        return None, None
+        
+    # Calculate head direction vector using available keypoints
+    head_direction = None
+    
+    if ear_left and ear_right:
+        # Use both ears to determine head direction
+        # The head points from the center of ears towards the nose
+        ear_center_x = (ear_left[0] + ear_right[0]) / 2
+        ear_center_y = (ear_left[1] + ear_right[1]) / 2
+        head_direction = (nose[0] - ear_center_x, nose[1] - ear_center_y)
+    elif ear_left:
+        # Use nose-to-left-ear vector as approximation (from ear to nose)
+        head_direction = (nose[0] - ear_left[0], nose[1] - ear_left[1])
+    elif ear_right:
+        # Use nose-to-right-ear vector as approximation (from ear to nose)
+        head_direction = (nose[0] - ear_right[0], nose[1] - ear_right[1])
+    
+    if not head_direction:
+        return None, None
+    
+    # Normalize head direction vector for consistent arrow display
+    head_length = math.sqrt(head_direction[0]**2 + head_direction[1]**2)
+    if head_length > 0:
+        normalized_head_direction = (head_direction[0] / head_length, head_direction[1] / head_length)
+    else:
+        normalized_head_direction = (1, 0)  # Default to pointing right
+        
+    # Calculate target direction vector from nose to target line
+    target_direction = None
+    
+    if target_line == 'right':
+        # Target is rightmost vertical line - pointing right towards target
+        target_direction = (1, 0)  # Unit vector pointing right
+    elif target_line == 'left':
+        # Target is leftmost vertical line - pointing left towards target
+        target_direction = (-1, 0)  # Unit vector pointing left
+    elif target_line == 'top':
+        # Target is topmost horizontal line - pointing up towards target
+        target_direction = (0, -1)  # Unit vector pointing up (negative Y)
+    elif target_line == 'bottom':
+        # Target is bottommost horizontal line - pointing down towards target
+        target_direction = (0, 1)  # Unit vector pointing down
+    
+    if not target_direction:
+        return None, None
+    
+    # Calculate angle between head direction and target direction
+    # Use dot product and cross product to get signed angle
+    # dot = |a||b|cos(θ), cross = |a||b|sin(θ)
+    dot_product = normalized_head_direction[0] * target_direction[0] + normalized_head_direction[1] * target_direction[1]
+    cross_product = normalized_head_direction[0] * target_direction[1] - normalized_head_direction[1] * target_direction[0]
+    
+    # Calculate angle using atan2 for proper quadrant handling
+    angle_rad = math.atan2(cross_product, dot_product)
+    angle_deg = math.degrees(angle_rad)
+    
+    # Normalize to 0-360 range
+    while angle_deg < 0:
+        angle_deg += 360
+    while angle_deg >= 360:
+        angle_deg -= 360
+    
+    return angle_deg, normalized_head_direction
+
+def get_target_line_position(target_line, frame_width, frame_height):
+    """Get the numerical position of the target line"""
+    if target_line == 'right':
+        return frame_width
+    elif target_line == 'left':
+        return 0
+    elif target_line == 'top':
+        return 0
+    elif target_line == 'bottom':
+        return frame_height
+    return None
+
 def now_tag():
     return datetime.now().strftime("%Y%m%dT%H%M%S")
 
@@ -300,6 +505,7 @@ class SimpleHeadPoseDetector:
         self.last_event_overlay = None
         self.last_event_time = 0.0
         self.last_detected = None  # Store last detected behavioral event for low confidence display
+        self.last_behavioral_instruction = None  # Store last meaningful behavioral instruction
         self.frame_reader_thread = None
         self.detection_thread = None
         self.stream_target_fps = config.stream_fps
@@ -372,6 +578,15 @@ class SimpleHeadPoseDetector:
         self.output_video_fps = config.output_video_fps
         self.video_writer = None
         self.output_video_path = None
+        
+        # Angle tracking with Kalman filtering
+        self.angle_kalman = AngleKalmanFilter(process_noise=1e-4, measurement_noise=1e-1)
+        self.current_angle = None
+        self.smoothed_angle = None
+        self.head_direction = None  # Store normalized head direction vector for arrow display
+        self.target_line_position = None
+        self.last_detected = None  # Store last detected behavioral event for no-detection handling
+        self.last_behavioral_instruction = None  # Store last meaningful behavioral instruction
         
     def load_model(self):
         """Load YOLO model and optionally wrap with embedding model"""
@@ -460,6 +675,14 @@ class SimpleHeadPoseDetector:
                     fps=self.capture_fps
                 )
                 print(f"✅ Advanced detector initialized: {frame_width}x{frame_height} @ {self.capture_fps:.1f} FPS")
+            
+            # Initialize angle tracking target line position
+            self.target_line_position = get_target_line_position(
+                self.config.target_line, 
+                frame_width, 
+                frame_height
+            )
+            print(f"✅ Angle tracking initialized: target_line={self.config.target_line} at position={self.target_line_position}")
             
             print(f"✅ Video loaded: {self.total_frames} frames at {self.capture_fps:.1f} FPS")
             return True
@@ -669,6 +892,15 @@ class SimpleHeadPoseDetector:
             else:
                 if self.verbose:
                     print(f"❌ Frame {self.current_frame_number}: No detections")
+                
+                # Handle no detection by displaying last detected behavioral event
+                last_instruction = self.last_behavioral_instruction or self.last_detected
+                if last_instruction:
+                    # Add overlay text showing last detected behavioral event
+                    overlay_text = f"CONF < {self.CONFIDENCE_THRESHOLD:.2f} - Last: {last_instruction}"
+                    safe_overlay = overlay_text.replace("→", "->").replace("←", "<-")
+                    cv2.putText(frame, safe_overlay, (10, frame.shape[0] - 50),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 255), 2)  # Blue color for low confidence
             
             return frame, results
             
@@ -709,13 +941,40 @@ class SimpleHeadPoseDetector:
                 if keypoints is not None and len(keypoints.xy) > 0:
                     kpts = keypoints.xy[0].cpu().numpy()
                     if len(kpts) >= 3:
-                        # Map keypoints: kpt0=ear_left, kpt1=ear_right, kpt2=nose
-                        if kpts[2][0] > 0 and kpts[2][1] > 0:
-                            nose = tuple(kpts[2])
+                        # Map keypoints: kpt0=nose, kpt1=ear_left, kpt2=ear_right
                         if kpts[0][0] > 0 and kpts[0][1] > 0:
-                            ear_left = tuple(kpts[0])
+                            nose = tuple(kpts[0])
                         if kpts[1][0] > 0 and kpts[1][1] > 0:
-                            ear_right = tuple(kpts[1])
+                            ear_left = tuple(kpts[1])
+                        if kpts[2][0] > 0 and kpts[2][1] > 0:
+                            ear_right = tuple(kpts[2])
+                
+                # Calculate head angle to target screen
+                if nose and (ear_left or ear_right):
+                    angle_result = calculate_head_angle_to_target(
+                        nose=nose,
+                        ear_left=ear_left,
+                        ear_right=ear_right,
+                        target_line=self.config.target_line,
+                        target_line_position=self.target_line_position,
+                        frame_width=self.frame_width,
+                        frame_height=self.frame_height
+                    )
+                    
+                    if angle_result[0] is not None:
+                        self.current_angle, self.head_direction = angle_result
+                        # Apply Kalman filtering for smooth angle tracking
+                        self.smoothed_angle = self.angle_kalman.update(self.current_angle)
+                        
+                        if self.verbose:
+                            angular_velocity = self.angle_kalman.get_angular_velocity()
+                            print(f"🧭 Angle to {self.config.target_line}: {self.current_angle:.1f}° → {self.smoothed_angle:.1f}° (vel: {angular_velocity:.2f}°/frame)")
+                    else:
+                        self.current_angle = None
+                        self.head_direction = None
+                else:
+                    self.current_angle = None
+                    self.head_direction = None
                 
                 # Process with ADVANCED detector
                 if self.advanced_detector:
@@ -771,7 +1030,10 @@ class SimpleHeadPoseDetector:
                         'distance_from_edge': distance_from_edge,
                         'speed_px_per_frame': speed,
                         'event_type': event_type,
-                        'event_name': event_name
+                        'event_name': event_name,
+                        'head_angle_raw': self.current_angle if self.current_angle is not None else float('nan'),
+                        'head_angle_smoothed': self.smoothed_angle if self.smoothed_angle is not None else float('nan'),
+                        'angular_velocity': self.angle_kalman.get_angular_velocity() if self.angle_kalman.initialized else float('nan')
                     })
                         
         except Exception as e:
@@ -846,6 +1108,7 @@ class SimpleHeadPoseDetector:
             self.last_event_overlay = overlay_text_ascii
             self.last_event_time = time.time()
             self.last_detected = overlay_text_ascii
+            self.last_behavioral_instruction = overlay_text_ascii  # Track meaningful instructions
         elif results:
             # Ensure periodic detection updates even without behavioral instructions
             if self.detection_count % 10 == 1:
@@ -868,7 +1131,7 @@ class SimpleHeadPoseDetector:
             status_text = event_overlay
         else:
             # Fallback status when no behavioral events
-            status_text = f"MONITORING | Frame: {frame_index} | Conf: &gt;{self.CONFIDENCE_THRESHOLD:.2f}"
+            status_text = f"Conf: <{self.CONFIDENCE_THRESHOLD:.2f}. Latest detection: {self.last_detected or 'None'}>"
         
         # Clean up text for display
         safe_overlay = status_text.replace("→", "->").replace("←", "<-")
@@ -880,6 +1143,23 @@ class SimpleHeadPoseDetector:
         video_time = f"Video: {frame_index / fps_for_display:.1f}s"
         cv2.putText(frame_with_detection, timestamp, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         cv2.putText(frame_with_detection, video_time, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        # Add angle information overlay
+        if self.smoothed_angle is not None:
+            angle_text = f"Angle to {self.config.target_line}: {self.smoothed_angle:.1f}`"
+            cv2.putText(frame_with_detection, angle_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)  # Cyan color
+            
+            # Draw angle direction indicator - arrow showing actual head direction
+            if hasattr(self, 'head_direction') and self.head_direction is not None:
+                # Draw small arrow in top-right corner showing actual head direction
+                arrow_center = (frame_width - 60, 40)
+                arrow_length = 30
+                # Use the actual head direction vector for the arrow
+                arrow_end = (
+                    int(arrow_center[0] + arrow_length * self.head_direction[0]),
+                    int(arrow_center[1] + arrow_length * self.head_direction[1])
+                )
+                cv2.arrowedLine(frame_with_detection, arrow_center, arrow_end, (0, 255, 255), 2, tipLength=0.3)
         
         # Overlay real-time FPS metrics
         detection_fps = self._compute_fps(self.detection_time_log)
@@ -918,6 +1198,7 @@ class SimpleHeadPoseDetector:
         self.stream_time_log.clear()
         self.last_event_overlay = None
         self.last_detected = None
+        self.last_behavioral_instruction = None
         self.last_event_time = 0.0
         self.latest_processed_frame = None
         self.latest_frame = None
@@ -1084,24 +1365,24 @@ class SimpleHeadPoseDetector:
                     conf=conf
                 )
                 
-                # Extract keypoints (nose=kpt2, ear_left=kpt0, ear_right=kpt1)
+                # Extract keypoints (nose=kpt0, ear_left=kpt1, ear_right=kpt2)
                 if keypoints is not None and len(keypoints.xy) > 0:
                     kpts = keypoints.xy[0].cpu().numpy()  # First detection keypoints
                     if len(kpts) >= 3:
                         # Extract keypoints with correct mapping
-                        kpt0 = kpts[0]  # ear_left
-                        kpt1 = kpts[1]  # ear_right  
-                        kpt2 = kpts[2]  # nose
+                        kpt0 = kpts[0]  # nose
+                        kpt1 = kpts[1]  # ear_left  
+                        kpt2 = kpts[2]  # ear_right
                         
-                        # Save nose position (kpt2) - THIS IS WHAT USER WANTS
-                        if kpt2[0] > 0 and kpt2[1] > 0:
-                            pose.nose = tuple(kpt2)
+                        # Save nose position (kpt0) - THIS IS WHAT USER WANTS
+                        if kpt0[0] > 0 and kpt0[1] > 0:
+                            pose.nose = tuple(kpt0)
                         
                         # Save ear positions
-                        if kpt0[0] > 0 and kpt0[1] > 0:
-                            pose.ear_left = tuple(kpt0)
                         if kpt1[0] > 0 and kpt1[1] > 0:
-                            pose.ear_right = tuple(kpt1)
+                            pose.ear_left = tuple(kpt1)
+                        if kpt2[0] > 0 and kpt2[1] > 0:
+                            pose.ear_right = tuple(kpt2)
         
         # Log detection to CSV (includes nose x,y if available)
         obs = PoseObservation(frame_count, pose)
@@ -1221,7 +1502,7 @@ class SimpleHeadPoseDetector:
                 writer = csv.DictWriter(f, fieldnames=[
                     'frame', 'timestamp', 'elapsed_sec', 'head_x', 'head_y', 
                     'confidence', 'distance_from_edge', 'speed_px_per_frame', 
-                    'event_type', 'event_name'
+                    'event_type', 'event_name', 'head_angle_raw', 'head_angle_smoothed', 'angular_velocity'
                 ])
                 writer.writeheader()
                 writer.writerows(self.trajectory_log)
@@ -1332,7 +1613,12 @@ class SimpleHeadPoseDetector:
             "stream_fps": stream_fps_measured,
             "confidence_threshold": self.CONFIDENCE_THRESHOLD,
             "output_dir": str(self.run_dir.resolve()) if self.run_dir else "Not started yet",
-            "predict_stream": self.use_predict_stream
+            "predict_stream": self.use_predict_stream,
+            "current_angle": self.current_angle,
+            "smoothed_angle": self.smoothed_angle,
+            "target_line": self.config.target_line,
+            "target_line_position": self.target_line_position,
+            "angle_tracking_enabled": True
         }
     
     def get_behavioral_events(self):
@@ -1577,6 +1863,11 @@ HTML_TEMPLATE = """
                         const detectFps = Number(data.detection_fps || 0).toFixed(1);
                         const streamFps = Number(data.stream_fps || 0).toFixed(1);
                         
+                        // Angle information
+                        const currentAngle = data.current_angle !== null ? Number(data.current_angle).toFixed(1) : 'N/A';
+                        const smoothedAngle = data.smoothed_angle !== null ? Number(data.smoothed_angle).toFixed(1) : 'N/A';
+                        const targetLine = data.target_line || 'N/A';
+                        
                         // Create inline status layout
                         statusDiv.innerHTML = `
                             <div style="display: flex; flex-wrap: wrap; gap: 12px; line-height: 1.6; align-items: center;">
@@ -1591,6 +1882,11 @@ HTML_TEMPLATE = """
                                 </div>
                                 <span>🔍 Conf: ${data.confidence_threshold}</span>
                                 <span>🛰️ YOLO stream: ${data.predict_stream ? 'ON' : 'OFF'}</span>
+                                <div style="display: flex; flex-direction: column; gap: 4px; padding: 8px; background: #f0f8ff; border-radius: 4px;">
+                                    <span>🧭 <strong>Head Angle Tracking</strong></span>
+                                    <span>📍 Target: ${targetLine} edge</span>
+                                    <span>📐 Current: ${currentAngle}° | Smoothed: ${smoothedAngle}°</span>
+                                </div>
                             </div>
                             <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #ddd;">
                                 <div style="font-size: 0.85em; color: #666;">
