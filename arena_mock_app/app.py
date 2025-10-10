@@ -2,16 +2,14 @@
 """
 FINAL Head Pose Detection Application
 =====================================
-CLEAN VERSION - No complex behavioral analysis, just working detection
-Key Issues Fixed:
-- NoneType errors eliminated  
-- Simple detection logic
+Key Issues:
+- Behavioral Detection logic
 - Stable streaming
 - Visual feedback with confidence threshold
 """
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION - Now loaded from config/.env
+# CONFIGURATION - loaded from config/.env
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import cv2
@@ -1250,7 +1248,7 @@ log.setLevel(logging.ERROR)  # Only show errors, not every request
 # Global detector instance
 detector = None
 
-# HTML Template with improved UI
+# HTML Template with UI
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
