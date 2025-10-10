@@ -47,6 +47,15 @@ sys.path.insert(0, parent_dir)
 print(f"🔧 Added to Python path: {lib_dir}")
 print(f"🔧 Added to Python path: {parent_dir}")
 
+# Try to import the embedding model
+try:
+    from lizard_tracking.models.embedding_pose import create_embedding_enhanced_model, EmbeddingOutput
+    EMBEDDING_MODEL_AVAILABLE = True
+    print("✅ Embedding model imported successfully")
+except ImportError as e:
+    EMBEDDING_MODEL_AVAILABLE = False
+    print(f"⚠️ Embedding model not available: {e}")
+
 # Load environment variables from config/.env
 config_path = os.path.join(script_dir, 'config', '.env')
 if os.path.exists(config_path):
@@ -135,6 +144,13 @@ class AppConfig:
         # Video saving with overlays
         self.save_video_with_overlays = os.getenv('SAVE_VIDEO_WITH_OVERLAYS', 'false').lower() == 'true'
         self.output_video_fps = float(os.getenv('OUTPUT_VIDEO_FPS', '15.0'))
+        
+        # Embedding-enhanced pose model
+        self.use_embedding_model = os.getenv('USE_EMBEDDING_MODEL', 'false').lower() == 'true'
+        self.embedding_dim = int(os.getenv('EMBEDDING_DIM', '64'))
+        self.embedding_memory_size = int(os.getenv('EMBEDDING_MEMORY_SIZE', '30'))
+        self.embedding_min_confidence = float(os.getenv('EMBEDDING_MIN_CONFIDENCE', '0.3'))
+        self.embedding_similarity_threshold = float(os.getenv('EMBEDDING_SIMILARITY_THRESHOLD', '0.7'))
     
     def print_config(self):
         """Print current configuration"""
@@ -152,6 +168,9 @@ class AppConfig:
         print(f"🎬 Save Video with Overlays: {self.save_video_with_overlays}")
         if self.save_video_with_overlays:
             print(f"📼 Output Video FPS: {self.output_video_fps}")
+        print(f"🧠 Embedding Model: {self.use_embedding_model}")
+        if self.use_embedding_model:
+            print(f"📊 Embedding Dim: {self.embedding_dim}, Memory: {self.embedding_memory_size}")
         print("="*60 + "\n")
 
 # Initialize global configuration
@@ -280,6 +299,7 @@ class SimpleHeadPoseDetector:
         self.stream_time_log = deque(maxlen=120)
         self.last_event_overlay = None
         self.last_event_time = 0.0
+        self.last_detected = None  # Store last detected behavioral event for low confidence display
         self.frame_reader_thread = None
         self.detection_thread = None
         self.stream_target_fps = config.stream_fps
@@ -354,7 +374,7 @@ class SimpleHeadPoseDetector:
         self.output_video_path = None
         
     def load_model(self):
-        """Load YOLO model"""
+        """Load YOLO model and optionally wrap with embedding model"""
         try:
             if torch.cuda.is_available():
                 device = torch.cuda.get_device_name(0)
@@ -364,6 +384,42 @@ class SimpleHeadPoseDetector:
             if torch.cuda.is_available():
                 self.model.to('cuda')
             print("✅ Model loaded on", "cuda" if torch.cuda.is_available() else "cpu")
+            
+            # Initialize embedding-enhanced model if enabled
+            if hasattr(CONFIG, 'use_embedding_model') and CONFIG.use_embedding_model and EMBEDDING_MODEL_AVAILABLE:
+                try:
+                    # Create a simple pose model wrapper for the embedding model
+                    class SimplePoseModel:
+                        def __init__(self, yolo_model):
+                            self.model = yolo_model
+                        
+                        def _extract(self, frame):
+                            results = self.model.predict(frame, conf=CONFIG.confidence_threshold, verbose=False)
+                            if results and len(results) > 0:
+                                res = results[0]
+                                if res.boxes is not None and len(res.boxes) > 0:
+                                    from lizard_tracking.models.embedding_pose import ModelOutput
+                                    return ModelOutput(
+                                        boxes=res.boxes.xyxy.cpu().numpy() if res.boxes.xyxy is not None else None,
+                                        confs=res.boxes.conf.cpu().numpy() if res.boxes.conf is not None else None,
+                                        keypoints=res.keypoints.xy.cpu().numpy() if res.keypoints is not None else None
+                                    )
+                            return None
+                    
+                    base_model = SimplePoseModel(self.model)
+                    self.embedding_model = create_embedding_enhanced_model(
+                        weights_path=self.model_path,
+                        embedding_dim=CONFIG.embedding_dim,
+                        enable_gap_filling=True
+                    )
+                    self.embedding_model.base_model = base_model  # Override with our wrapper
+                    print(f"✅ Embedding model enabled (dim={CONFIG.embedding_dim}, memory={CONFIG.embedding_memory_size})")
+                except Exception as e:
+                    print(f"⚠️ Embedding model failed to initialize: {e}")
+                    self.embedding_model = None
+            else:
+                self.embedding_model = None
+            
             return True
         except Exception as e:
             print(f"❌ Model loading failed: {e}")
@@ -478,11 +534,56 @@ class SimpleHeadPoseDetector:
         return frame
     
     def detect_poses(self, frame):
-        """Run YOLO detection on the provided frame and draw overlays"""
+        """Run YOLO detection (with optional embedding enhancement) and draw overlays"""
         if self.model is None:
             return frame, []
         
         try:
+            # Use embedding model if available
+            if hasattr(self, 'embedding_model') and self.embedding_model is not None:
+                try:
+                    embedding_output = self.embedding_model.predict_with_embeddings(frame)
+                    
+                    if embedding_output.pose_output is not None:
+                        # Convert back to YOLO format for drawing
+                        class MockResult:
+                            def __init__(self, pose_output):
+                                self.boxes = MockBoxes(pose_output.boxes, pose_output.confs)
+                                self.keypoints = MockKeypoints(pose_output.keypoints)
+                        
+                        class MockBoxes:
+                            def __init__(self, boxes, confs):
+                                self.xyxy = torch.from_numpy(boxes) if boxes is not None else None
+                                self.conf = torch.from_numpy(confs) if confs is not None else None
+                        
+                        class MockKeypoints:
+                            def __init__(self, keypoints):
+                                self.xy = torch.from_numpy(keypoints) if keypoints is not None else None
+                        
+                        results = [MockResult(embedding_output.pose_output)]
+                        
+                        # Add embedding info to status
+                        if embedding_output.filled_from_embedding:
+                            self.last_event_overlay = f"🧠 EMBEDDING FILL: conf {embedding_output.confidence:.2f}"
+                            self.last_event_time = time.time()
+                        
+                        if self.verbose and embedding_output.filled_from_embedding:
+                            print(f"🧠 Frame {self.current_frame_number}: Filled from embedding (conf: {embedding_output.confidence:.2f})")
+                        
+                        # Continue with normal drawing
+                        frame_with_detection = self.draw_simple_detection(frame, results)
+                        return frame_with_detection, results
+                    else:
+                        results = []
+                        frame_with_detection = frame.copy()
+                        return frame_with_detection, results
+                        
+                except Exception as e:
+                    if self.verbose:
+                        print(f"⚠️ Embedding model error: {e}, falling back to standard detection")
+                    # Fall through to standard detection
+            
+            # Standard YOLO detection
             device_target = 'cuda' if torch.cuda.is_available() else 'cpu'
             detect_iou = self.detection_iou
             detect_imgsz = self.detection_imgsz
@@ -755,7 +856,7 @@ class SimpleHeadPoseDetector:
                         primary_conf = float(first_result.boxes[0].conf[0])
                 except Exception:
                     primary_conf = None
-                conf_text = f"{primary_conf:.2f}" if primary_conf is not None else f"< {self.CONFIDENCE_THRESHOLD:.2f}"
+                conf_text = f"{primary_conf:.2f}" if primary_conf is not None else f"&lt;{self.CONFIDENCE_THRESHOLD:.2f}"
                 self.add_behavioral_event("detection", f"Head detected (conf: {conf_text})")
                 last_detection = self.last_detected
                 self.last_event_overlay = f"DETECTION: conf {conf_text}. Last detection: {last_detection}"
@@ -767,7 +868,7 @@ class SimpleHeadPoseDetector:
             status_text = event_overlay
         else:
             # Fallback status when no behavioral events
-            status_text = f"MONITORING | Frame: {frame_index} | Conf: >{self.CONFIDENCE_THRESHOLD:.2f}"
+            status_text = f"MONITORING | Frame: {frame_index} | Conf: &gt;{self.CONFIDENCE_THRESHOLD:.2f}"
         
         # Clean up text for display
         safe_overlay = status_text.replace("→", "->").replace("←", "<-")
