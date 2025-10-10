@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
-FINAL Head Pose Detection Application
+Head Pose Detection Application
 =====================================
-CLEAN VERSION - No complex behavioral analysis, just working detection
-Key Issues Fixed:
 - NoneType errors eliminated  
 - Simple detection logic
 - Stable streaming
