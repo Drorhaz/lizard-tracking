@@ -7,6 +7,7 @@ from typing import Dict, Any, List, Optional
 import pandas as pd
 import matplotlib.pyplot as plt
 import re
+import numpy as np
 
 
 # ----------------------------- CONFIG (edit here) ----------------------------- #
@@ -37,7 +38,7 @@ CONFIG: Dict[str, Any] = {
     "DEMOS_SUBDIR": "inference_demos",
 
     # Which devices to time (order matters; GPU first avoids CUDA sticky -1)
-    "DEVICES": ["gpu0", "cpu"],        # "gpu0" means first visible GPU; add "gpu1" if needed
+    "DEVICES": ["gpu0"],        # "gpu0" means first visible GPU; add "gpu1" if needed.  ["gpu0", "cpu"]
 }
 # ----------------------------------------------------------------------------- #
 
@@ -258,6 +259,87 @@ def _bar_if_any(out_dir: Path, df: pd.DataFrame, cols: List[str], title: str, xl
     fig.tight_layout(); fig.savefig(out_dir / fname, dpi=CONFIG["SAVE_PNG_DPI"]); plt.close(fig)
     print(f"[ok] wrote {out_dir/fname}")
 
+def _combined_metrics_plot(out_dir: Path, cmp: pd.DataFrame):
+    """Create grouped bars (accuracy, detection, speed) for each run."""
+    def _pick_val(row, cols: List[str]) -> float:
+        for c in cols:
+            if c in row and pd.notna(row[c]):
+                try:
+                    return float(row[c])
+                except (TypeError, ValueError):
+                    continue
+        return float("nan")
+
+    def _maybe_percent(val: float) -> float:
+        if math.isnan(val):
+            return val
+        return val * 100.0 if val <= 1.5 else val
+
+    records = []
+    for _, row in cmp.iterrows():
+        run = row.get("run", "")
+        if not run:
+            continue
+        acc = _pick_val(row, ["best_map", "final_map"])
+        det = _pick_val(row, ["gpu0_det_rate", "cpu_det_rate"])
+        speed = _pick_val(row, ["gpu0_fps", "cpu_fps"])
+        if math.isnan(speed):
+            avg_ms = _pick_val(row, ["gpu0_avg_ms", "cpu_avg_ms"])
+            if not math.isnan(avg_ms) and avg_ms > 0:
+                speed = 1000.0 / avg_ms
+        acc = _maybe_percent(acc)
+        det = _maybe_percent(det)
+        records.append({"run": run, "accuracy": acc, "det_rate": det, "speed": speed})
+
+    if not records:
+        print("[skip] combined metrics plot: no comparable metrics available")
+        return
+
+    runs = [r["run"] for r in records]
+    acc_vals = np.array([r["accuracy"] for r in records], dtype=float)
+    det_vals = np.array([r["det_rate"] for r in records], dtype=float)
+    speed_vals = np.array([r["speed"] for r in records], dtype=float)
+
+    metrics = []
+    if not np.isnan(acc_vals).all():
+        metrics.append(("Accuracy (%)", acc_vals, "#1f77b4"))
+    if not np.isnan(det_vals).all():
+        metrics.append(("Detection Rate (%)", det_vals, "#ff7f0e"))
+    if not np.isnan(speed_vals).all():
+        metrics.append(("Speed (FPS)", speed_vals, "#2ca02c"))
+
+    if not metrics:
+        print("[skip] combined metrics plot: no comparable metrics available")
+        return
+
+    x = np.arange(len(runs))
+    n_metrics = len(metrics)
+    fig_width = max(7.0, 1.2 * len(runs))
+    fig, ax = plt.subplots(figsize=(fig_width, 5.0))
+
+    bar_width = 0.8 / n_metrics
+    offsets = np.linspace(-bar_width * (n_metrics - 1) / 2, bar_width * (n_metrics - 1) / 2, n_metrics)
+
+    for offset, (label, values, color) in zip(offsets, metrics):
+        bars = ax.bar(x + offset, values, width=bar_width, label=label, color=color)
+        for bx, val in zip(bars, values):
+            if not np.isnan(val):
+                ax.text(bx.get_x() + bx.get_width() / 2, val, f"{val:.1f}", ha="center", va="bottom", fontsize=8)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(runs, rotation=35, ha="right")
+    ax.set_ylabel("Score")
+    ax.set_title("Model comparison overview")
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
+    ax.set_axisbelow(True)
+    ax.legend()
+
+    fig.tight_layout()
+    out_path = out_dir / "cmp_overview.png"
+    fig.savefig(out_path, dpi=CONFIG["SAVE_PNG_DPI"])
+    plt.close(fig)
+    print(f"[ok] wrote {out_path}")
+
 # ------------------------------ main pipeline -------------------------------- #
 def compare_models():
     runs_dir = Path(CONFIG["RUNS_DIR"])
@@ -377,6 +459,8 @@ def compare_models():
     if any(c in cmp.columns for c in [cpu_dr, gpu_dr]):
         _bar_if_any(out_dir, cmp, [c for c in [gpu_dr, cpu_dr] if c in cmp.columns],
                     "Detection rate (timed set)", "rate", "cmp_det_rate_multi.png")
+
+    _combined_metrics_plot(out_dir, cmp)
 
     # Size / Params
     if "size_mb" in cmp.columns:
