@@ -324,11 +324,14 @@ def calculate_head_angle_to_target(nose, ear_left, ear_right, target_line, targe
         
     Returns:
         tuple: (angle_degrees, head_direction_vector)
-               angle_degrees: angle in degrees (0-360°)
-                             0° = pointing directly at target
-                             90° = pointing perpendicular to target (counterclockwise)
-                             180° = pointing away from target
-                             270° = pointing perpendicular to target (clockwise)
+                             angle_degrees: angle in degrees (0-360°)
+                                                         Convention: angle is measured from a vector that is
+                                                         parallel to the target line to the head vector (ears->nose).
+                                                         Therefore:
+                                                             0°   = head vector is parallel to the target line
+                                                             90°  = head vector is perpendicular to the target line (counterclockwise)
+                                                             180° = head vector is parallel but opposite direction
+                                                             270° = head vector is perpendicular to the target line (clockwise)
                head_direction_vector: (x, y) normalized vector showing head direction
     """
     if not nose or (not ear_left and not ear_right):
@@ -363,18 +366,16 @@ def calculate_head_angle_to_target(nose, ear_left, ear_right, target_line, targe
     # Calculate target direction vector from nose to target line
     target_direction = None
     
-    if target_line == 'right':
-        # Target is rightmost vertical line - pointing right towards target
-        target_direction = (1, 0)  # Unit vector pointing right
-    elif target_line == 'left':
-        # Target is leftmost vertical line - pointing left towards target
-        target_direction = (-1, 0)  # Unit vector pointing left
-    elif target_line == 'top':
-        # Target is topmost horizontal line - pointing up towards target
-        target_direction = (0, -1)  # Unit vector pointing up (negative Y)
-    elif target_line == 'bottom':
-        # Target is bottommost horizontal line - pointing down towards target
-        target_direction = (0, 1)  # Unit vector pointing down
+    # IMPORTANT: use a vector that is PARALLEL to the target line (not the normal
+    # pointing toward the target). This makes 0° correspond to the head being
+    # aligned with the target line.
+    if target_line in ('right', 'left'):
+        # Right/left are vertical lines -> use a vertical unit vector (downwards)
+        # Image coordinates: +Y is downward, so (0, 1) is a canonical vertical vector.
+        target_direction = (0, 1)
+    elif target_line in ('top', 'bottom'):
+        # Top/bottom are horizontal lines -> use a horizontal unit vector (rightwards)
+        target_direction = (1, 0)
     
     if not target_direction:
         return None, None
