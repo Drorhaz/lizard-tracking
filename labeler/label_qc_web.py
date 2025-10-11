@@ -18,7 +18,7 @@ Resumes at first unreviewed using ok/skip logs. Writes label .bak once.
 from __future__ import annotations
 from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import io, os, json, math, shutil, socket
 
 from flask import Flask, request, jsonify, send_file, render_template_string, url_for
@@ -126,6 +126,98 @@ def draw_bbox(im, W,H, cx,cy,w,h, color=(0,255,0), thick=2):
     x2=int((cx+w/2)*W); y2=int((cy+h/2)*H)
     cv2.rectangle(im,(x1,y1),(x2,y2),color,thick)
 
+Keypoint = Tuple[float, float, float]
+
+def looks_like_visibility(val: float) -> bool:
+    """Return True if val is effectively an integer 0/1/2."""
+    if not math.isfinite(val):
+        return False
+    rounded = round(val)
+    return 0.0 <= rounded <= 2.0 and abs(val - rounded) <= 1e-3
+
+def parse_pose_tokens(t: List[str]) -> Tuple[str, float, float, float, float, Keypoint, Keypoint, Keypoint, bool, Dict[str, float]]:
+    """Return (cls, cx, cy, w, h, nose, L, R, has_visibility, extras)."""
+    cls_id = t[0] if t else "0"
+    cx = cy = 0.5
+    w = h = DEFAULT_BOX
+    if len(t) >= 5:
+        try:
+            cx, cy, w, h = map(float, t[1:5])
+        except (TypeError, ValueError):
+            pass
+
+    tail_vals: List[float] = []
+    for val in t[5:]:
+        try:
+            tail_vals.append(float(val))
+        except (TypeError, ValueError):
+            tail_vals.append(0.0)
+
+    nose: Keypoint = (cx, cy, 0.0)
+    left: Keypoint = (cx, cy, 0.0)
+    right: Keypoint = (cx, cy, 0.0)
+    extras: Dict[str, float] = {}
+
+    tail_len = len(tail_vals)
+    has_visibility = False
+
+    if tail_len >= 10 and looks_like_visibility(tail_vals[3]) and looks_like_visibility(tail_vals[6]) and looks_like_visibility(tail_vals[9]):
+        extras["nose_conf"] = tail_vals[2]
+        nose = (tail_vals[0], tail_vals[1], tail_vals[3])
+        left = (tail_vals[4], tail_vals[5], tail_vals[6])
+        right = (tail_vals[7], tail_vals[8], tail_vals[9])
+        has_visibility = True
+    elif tail_len >= 9 and looks_like_visibility(tail_vals[2]) and looks_like_visibility(tail_vals[5]) and looks_like_visibility(tail_vals[8]):
+        nose = (tail_vals[0], tail_vals[1], tail_vals[2])
+        left = (tail_vals[3], tail_vals[4], tail_vals[5])
+        right = (tail_vals[6], tail_vals[7], tail_vals[8])
+        has_visibility = True
+    elif tail_len >= 6:
+        nose = (tail_vals[0], tail_vals[1], 2.0)
+        left = (tail_vals[2], tail_vals[3], 2.0)
+        right = (tail_vals[4], tail_vals[5], 2.0)
+    elif tail_len >= 4:
+        nose = (tail_vals[0], tail_vals[1], 2.0)
+        left = (tail_vals[2], tail_vals[3], 2.0)
+    elif tail_len >= 2:
+        nose = (tail_vals[0], tail_vals[1], 2.0)
+
+    return cls_id, cx, cy, w, h, nose, left, right, has_visibility, extras
+
+def _format_xy(val: float) -> str:
+    return f"{clamp01(val):.6f}"
+
+def format_pose_tokens(cls_id: str, cx: float, cy: float, w: float, h: float,
+                       nose: Keypoint, left: Keypoint, right: Keypoint,
+                       include_visibility: bool = True,
+                       extras: Optional[Dict[str, float]] = None) -> List[str]:
+    extras = extras or {}
+    tokens = [
+        str(cls_id),
+        f"{cx:.6f}",
+        f"{cy:.6f}",
+        f"{w:.6f}",
+        f"{h:.6f}",
+    ]
+    nose_conf = extras.get("nose_conf")
+    tokens.append(_format_xy(nose[0]))
+    tokens.append(_format_xy(nose[1]))
+    if nose_conf is not None and include_visibility:
+        tokens.append(f"{float(nose_conf):.6f}")
+    elif nose_conf is not None:
+        tokens.append(f"{float(nose_conf):.6f}")
+    if include_visibility:
+        tokens.append(f"{float(nose[2]):.1f}")
+    tokens.append(_format_xy(left[0]))
+    tokens.append(_format_xy(left[1]))
+    if include_visibility:
+        tokens.append(f"{float(left[2]):.1f}")
+    tokens.append(_format_xy(right[0]))
+    tokens.append(_format_xy(right[1]))
+    if include_visibility:
+        tokens.append(f"{float(right[2]):.1f}")
+    return tokens
+
 def render_overlay(pair: Pair) -> np.ndarray:
     im = cv2.imread(str(pair.img))
     if im is None:
@@ -135,22 +227,18 @@ def render_overlay(pair: Pair) -> np.ndarray:
     H,W = im.shape[:2]
     tokens = read_label(pair.lbl)
     for t in tokens:
-        if len(t)==14:
-            cx,cy,w,h = map(float, t[1:5])
-            draw_bbox(im,W,H,cx,cy,w,h,(0,255,0),THICK)
-            k = list(map(float, t[5:]))
-            nose=(int(k[0]*W), int(k[1]*H), int(k[2]))
-            L   =(int(k[3]*W), int(k[4]*H), int(k[5]))
-            R   =(int(k[6]*W), int(k[7]*H), int(k[8]))
-            if nose[2]>0: cv2.circle(im, (nose[0],nose[1]), RADIUS, (0,0,255), -1)
-            if L[2]>0:    cv2.circle(im, (L[0],L[1]),     RADIUS, (255,0,0), -1)
-            if R[2]>0:    cv2.circle(im, (R[0],R[1]),     RADIUS, (255,0,0), -1)
-            if nose[2]>0 and L[2]>0 and R[2]>0:
-                mx=(L[0]+R[0])//2; my=(L[1]+R[1])//2
-                cv2.line(im, (nose[0],nose[1]), (mx,my), (0,255,255), THICK)
-        elif len(t)==5:
-            cx,cy,w,h = map(float, t[1:5])
-            draw_bbox(im,W,H,cx,cy,w,h,(0,255,0),THICK)
+        if len(t) >= 5:
+            cls_id, cx, cy, w, h, nose, left, right, _, _ = parse_pose_tokens(t)
+            draw_bbox(im, W, H, cx, cy, w, h, (0,255,0), THICK)
+            nose_px = (int(nose[0]*W), int(nose[1]*H), int(round(nose[2])))
+            left_px = (int(left[0]*W), int(left[1]*H), int(round(left[2])))
+            right_px = (int(right[0]*W), int(right[1]*H), int(round(right[2])))
+            if nose_px[2]>0: cv2.circle(im, (nose_px[0],nose_px[1]), RADIUS, (0,0,255), -1)
+            if left_px[2]>0: cv2.circle(im, (left_px[0],left_px[1]),  RADIUS, (255,0,0), -1)
+            if right_px[2]>0: cv2.circle(im, (right_px[0],right_px[1]), RADIUS, (255,0,0), -1)
+            if nose_px[2]>0 and left_px[2]>0 and right_px[2]>0:
+                mx=(left_px[0]+right_px[0])//2; my=(left_px[1]+right_px[1])//2
+                cv2.line(im, (nose_px[0],nose_px[1]), (mx,my), (0,255,255), THICK)
     return im
 
 def img_to_png_bytes(im: np.ndarray) -> bytes:
@@ -172,6 +260,25 @@ def commit_edit(pair: Pair, edit: Dict[str, Any]) -> bool:
         return False
     H,W = im.shape[:2]
 
+    if not tokens:
+        cx0, cy0 = 0.5, 0.5
+        side = DEFAULT_BOX
+        tokens = [format_pose_tokens(
+            "0",
+            cx0,
+            cy0,
+            side,
+            side,
+            (cx0, cy0, 0.0),
+            (cx0, cy0, 0.0),
+            (cx0, cy0, 0.0),
+        )]
+
+    cls_id, cx, cy, w, h, nose, L, R, _has_visibility, meta = parse_pose_tokens(tokens[0])
+    meta = dict(meta)
+    def drop_conf():
+        meta.pop("nose_conf", None)
+
     # seeding from scratch or reseeding: place keypoints around click, leaving bbox untouched
     if "seed_template" in edit:
         seed = edit["seed_template"]
@@ -179,84 +286,20 @@ def commit_edit(pair: Pair, edit: Dict[str, Any]) -> bool:
         seed_y = float(seed.get("y", H / 2))
         nx, ny = normalized_from_pixels(seed_x, seed_y, W, H)
 
-        if not tokens:
-            cx0, cy0 = 0.5, 0.5
-            side = DEFAULT_BOX
-            new = [
-                "0",
-                f"{cx0:.6f}",
-                f"{cy0:.6f}",
-                f"{side:.6f}",
-                f"{side:.6f}",
-                f"{cx0:.6f}",
-                f"{cy0:.6f}",
-                "0",
-                f"{cx0:.6f}",
-                f"{cy0:.6f}",
-                "0",
-                f"{cx0:.6f}",
-                f"{cy0:.6f}",
-                "0",
-            ]
-            tokens = [new]
-
-        t = tokens[0]
-        if len(t) == 5:
-            cx0, cy0, w0, h0 = map(float, t[1:5])
-            t = t[:5] + [
-                f"{cx0:.6f}",
-                f"{cy0:.6f}",
-                "0",
-                f"{cx0:.6f}",
-                f"{cy0:.6f}",
-                "0",
-                f"{cx0:.6f}",
-                f"{cy0:.6f}",
-                "0",
-            ]
-
-        cx, cy, w, h = map(float, t[1:5])
         span = w if w > 0 else DEFAULT_BOX
         ear_dx = max(0.02, min(0.25, span * 0.3))
         nose = (nx, ny, 2.0)
         left = (clamp01(nx - ear_dx), ny, 2.0)
         right = (clamp01(nx + ear_dx), ny, 2.0)
 
-        def spt(pt):
-            x, y, v = pt
-            return [f"{x:.6f}", f"{y:.6f}", f"{float(v):.1f}"]
-
-        head = [t[0], f"{cx:.6f}", f"{cy:.6f}", f"{w:.6f}", f"{h:.6f}"]
-        new_t = head + spt(nose) + spt(left) + spt(right)
-
+        meta = {}
+        new_t = format_pose_tokens(cls_id, cx, cy, w, h, nose, left, right, include_visibility=True, extras=meta)
         ensure_backup(pair.lbl)
         tokens[0] = new_t
         write_label(pair.lbl, tokens)
         im2 = render_overlay(pair)
         cv2.imwrite(str(OUT_PREVIEW / pair.img.name), im2)
         return True
-
-    if not tokens:
-        # create a blank 14-token line with a tiny bbox at center and invisible kps
-        cx,cy,w,h = 0.5,0.5, DEFAULT_BOX,DEFAULT_BOX
-        new = ["0", f"{cx:.6f}", f"{cy:.6f}", f"{w:.6f}", f"{h:.6f}",
-               f"{cx:.6f}", f"{cy:.6f}", "0",
-               f"{cx:.6f}", f"{cy:.6f}", "0",
-               f"{cx:.6f}", f"{cy:.6f}", "0"]
-        tokens = [new]
-
-    t = tokens[0]
-    # upgrade 5->14 if needed (so we can store keypoints consistently)
-    if len(t)==5:
-        cx,cy,w,h = map(float, t[1:5])
-        t = t[:5] + [f"{cx:.6f}",f"{cy:.6f}","0",  f"{cx:.6f}",f"{cy:.6f}","0",  f"{cx:.6f}",f"{cy:.6f}","0"]
-
-    # unpack
-    cx,cy,w,h = map(float, t[1:5])
-    k = list(map(float, t[5:]))
-    nose=(k[0],k[1],k[2]) if len(k)>=3 else (cx,cy,0.0)
-    L   =(k[3],k[4],k[5]) if len(k)>=6 else (cx,cy,0.0)
-    R   =(k[6],k[7],k[8]) if len(k)>=9 else (cx,cy,0.0)
 
     old_cx, old_cy, old_w, old_h = cx, cy, w, h
     bbox_changed = False
@@ -288,7 +331,7 @@ def commit_edit(pair: Pair, edit: Dict[str, Any]) -> bool:
         delta_cx = cx - old_cx
         delta_cy = cy - old_cy
 
-        def remap_point(pt: tuple[float, float, float]) -> tuple[float, float, float]:
+        def remap_point(pt: Keypoint) -> Keypoint:
             x, y, v = pt
             if old_w <= 1e-6 or old_h <= 1e-6:
                 x = clamp01(x + delta_cx)
@@ -303,17 +346,21 @@ def commit_edit(pair: Pair, edit: Dict[str, Any]) -> bool:
         nose = remap_point(nose)
         L = remap_point(L)
         R = remap_point(R)
+        drop_conf()
 
     # keypoint perms/drags/toggles/sets
     if edit.get("perm") == "cycle_left":
         nose, L, R = L, R, nose
+        drop_conf()
     if edit.get("perm") == "cycle_right":
         nose, R, L = R, L, nose
+        drop_conf()
 
     if "drag" in edit:
         which=edit["drag"]["which"]; px=float(edit["drag"]["x"]); py=float(edit["drag"]["y"])
         nx,ny = normalized_from_pixels(px, py, W, H)
-        if which=="nose": nose=(nx,ny,2.0)
+        if which=="nose":
+            nose=(nx,ny,2.0); drop_conf()
         elif which=="L":  L=(nx,ny,2.0)
         elif which=="R":  R=(nx,ny,2.0)
 
@@ -330,7 +377,7 @@ def commit_edit(pair: Pair, edit: Dict[str, Any]) -> bool:
             vv = int(float(v))
             return 2.0 if vv>=2 else (1.0 if vv==1 else 0.0)
         if "nose" in s:
-            x,y,v = s["nose"]; nose = (clamp01(x), clamp01(y), clampv(v))
+            x,y,v = s["nose"]; nose = (clamp01(x), clamp01(y), clampv(v)); drop_conf()
         if "L" in s:
             x,y,v = s["L"];    L    = (clamp01(x), clamp01(y), clampv(v))
         if "R" in s:
@@ -341,9 +388,7 @@ def commit_edit(pair: Pair, edit: Dict[str, Any]) -> bool:
             w  = clamp01(bb.get("w", w));   h  = clamp01(bb.get("h", h))
 
     # pack and save
-    head=[t[0], f"{cx:.6f}", f"{cy:.6f}", f"{w:.6f}", f"{h:.6f}"]
-    def spt(pt): x,y,v=pt; return [f"{x:.6f}", f"{y:.6f}", f"{float(v):.1f}"]
-    new_t = head + spt(nose)+spt(L)+spt(R)
+    new_t = format_pose_tokens(cls_id, cx, cy, w, h, nose, L, R, include_visibility=True, extras=meta)
 
     ensure_backup(pair.lbl)
     tokens[0] = new_t
@@ -356,16 +401,16 @@ def commit_edit(pair: Pair, edit: Dict[str, Any]) -> bool:
 
 def nearest_kp(pair: Pair, x: float, y: float) -> Optional[str]:
     tokens = read_label(pair.lbl)
-    if not tokens or len(tokens[0]) < 14:
+    if not tokens:
         return None
     im = cv2.imread(str(pair.img)); 
     if im is None: return None
     H,W = im.shape[:2]
-    k = list(map(float, tokens[0][5:]))
+    _, _, _, _, _, nose, L, R, _, _ = parse_pose_tokens(tokens[0])
     pts = {
-        "nose": (k[0]*W, k[1]*H, int(k[2])),
-        "L":    (k[3]*W, k[4]*H, int(k[5])),
-        "R":    (k[6]*W, k[7]*H, int(k[8])),
+        "nose": (nose[0]*W, nose[1]*H, int(round(max(nose[2], 0.0)))),
+        "L":    (L[0]*W,    L[1]*H,    int(round(max(L[2], 0.0)))),
+        "R":    (R[0]*W,    R[1]*H,    int(round(max(R[2], 0.0)))),
     }
     best=None; bestd=1e18
     for name,(px,py,v) in pts.items():
@@ -1073,14 +1118,12 @@ def state_json(i: int):
     bbox = None
     if tokens:
         t0 = tokens[0]
-        if len(t0)>=5:
-            cx,cy,w,h = map(float, t0[1:5])
+        if len(t0) >= 5:
+            _, cx, cy, w, h, nose, left, right, _, _ = parse_pose_tokens(t0)
             bbox = {"cx":cx,"cy":cy,"w":w,"h":h}
-        if len(t0)==14:
-            k = list(map(float, t0[5:]))
-            kps["nose"]={"x":k[0],"y":k[1],"v":int(k[2])}
-            kps["L"]   ={"x":k[3],"y":k[4],"v":int(k[5])}
-            kps["R"]   ={"x":k[6],"y":k[7],"v":int(k[8])}
+            kps["nose"] = {"x": clamp01(nose[0]), "y": clamp01(nose[1]), "v": int(round(max(nose[2], 0.0)))}
+            kps["L"]    = {"x": clamp01(left[0]), "y": clamp01(left[1]), "v": int(round(max(left[2], 0.0)))}
+            kps["R"]    = {"x": clamp01(right[0]), "y": clamp01(right[1]), "v": int(round(max(right[2], 0.0)))}
     label_text = "\n".join(" ".join(t) for t in tokens) if tokens else ""
     return jsonify(
         W=W,
