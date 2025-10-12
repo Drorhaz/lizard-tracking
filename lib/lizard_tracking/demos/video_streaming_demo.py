@@ -21,7 +21,7 @@ except ImportError as e:
     sys.exit(1)
 
 # Video configuration
-VIDEO_PATH = "/a/home/cc/students/neurosci/bareketd1/sandbox/lizard-tracking/pose-head/videos/top_20250916T150021.mp4"
+VIDEO_PATH = "../arena_mock_app/videos/top_20250916T150021.mp4"
 TARGET_FPS = 10
 
 # Create Flask app

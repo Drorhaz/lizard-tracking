@@ -1,0 +1,9 @@
+{
+  "base_model": "../head_pose/best.pt",
+  "embedding_head": "embedding_head.pt",
+  "embedding_dim": 64,
+  "input_dim": 9,
+  "training_epochs": 20,
+  "training_images": 100,
+  "purpose": "gap_filling_and_temporal_consistency"
+}

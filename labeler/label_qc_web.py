@@ -46,7 +46,7 @@ CANVAS_MAX_W = 800
 RADIUS = 6
 THICK  = 2
 HANDLE_R = 8  # bbox corner handle radius (px in display space)
-DEFAULT_BOX = 0.12  # default normalized side length for seeded heads
+DEFAULT_BOX = 0.07  # default normalized side length for seeded heads
 # ======================================================
 
 IMG_EXTS = {".jpg",".jpeg",".png",".bmp",".tif",".tiff"}
@@ -252,6 +252,28 @@ def normalized_from_pixels(px: float, py: float, W: int, H: int):
 def clamp01(z: float) -> float:
     return max(0.0, min(1.0, float(z)))
 
+def zero_label_tokens() -> List[str]:
+    """Return a YOLO pose label (class + bbox + keypoints) populated entirely with zeros."""
+    return ["0"] + ["0"] * 16
+
+def label_is_empty(lbl_path: Path) -> bool:
+    """Return True if the label file is missing or only contains zeros."""
+    if not lbl_path.exists():
+        return True
+    tokens = read_label(lbl_path)
+    if not tokens:
+        return True
+    for row in tokens:
+        if len(row) <= 1:
+            continue
+        try:
+            values = [float(x) for x in row[1:]]
+        except (TypeError, ValueError):
+            return False
+        if any(abs(v) > 1e-6 for v in values):
+            return False
+    return True
+
 def commit_edit(pair: Pair, edit: Dict[str, Any]) -> bool:
     """Apply edits to first object line (create if missing)."""
     tokens = read_label(pair.lbl)
@@ -286,11 +308,18 @@ def commit_edit(pair: Pair, edit: Dict[str, Any]) -> bool:
         seed_y = float(seed.get("y", H / 2))
         nx, ny = normalized_from_pixels(seed_x, seed_y, W, H)
 
-        span = w if w > 0 else DEFAULT_BOX
-        ear_dx = max(0.02, min(0.25, span * 0.3))
+        # Seed a triangular pose inside the bbox and adjust bbox around it
+        base_span = max(w, h, DEFAULT_BOX)
+        bbox_side = clamp01(base_span * 1.2)
+        cx, cy = nx, ny
+        w = h = bbox_side
+
+        ear_offset_x = clamp01(bbox_side * 0.25)
+        ear_offset_y = clamp01(bbox_side * 0.15)
+
         nose = (nx, ny, 2.0)
-        left = (clamp01(nx - ear_dx), ny, 2.0)
-        right = (clamp01(nx + ear_dx), ny, 2.0)
+        left = (clamp01(nx - ear_offset_x), clamp01(ny + ear_offset_y), 2.0)
+        right = (clamp01(nx + ear_offset_x), clamp01(ny + ear_offset_y), 2.0)
 
         meta = {}
         new_t = format_pose_tokens(cls_id, cx, cy, w, h, nose, left, right, include_visibility=True, extras=meta)
@@ -469,13 +498,15 @@ TEMPLATE = """
   </style>
 </head>
 <body>
-<h3>Label QC ({{ idx+1 }}/{{ total }}) — remaining {{ remaining }}</h3>
+<h3>Label QC ({{ display_pos + 1 if has_data else 0 }}/{{ total }}) — remaining {{ remaining }}</h3>
 <p class="muted">{{ imgname }}</p>
+<p><strong>Global image index:</strong> {{ idx }}</p>
 
 <form class="dataset" method="get">
   <label>Images dir <input type="text" name="img_dir" value="{{ images_root }}"></label>
   <label>Labels dir <input type="text" name="lbl_dir" value="{{ labels_root }}"></label>
   <label>Split <input type="text" name="split" value="{{ split }}" style="width:120px"></label>
+  <input type="hidden" name="filter" value="{{ filter_mode }}">
   <label>Image <input type="text" name="image" placeholder="path/to/image" value="{{ current_image }}" style="width:280px"></label>
   <button type="submit">Load</button>
   {% if has_data %}
@@ -490,15 +521,21 @@ TEMPLATE = """
     <div class="row">
       <button onclick="cycle('left')">⟲ Cycle</button>
       <button onclick="cycle('right')">Cycle ⟳</button>
-      <button onclick="mark('ok')">OK</button>
+      <button onclick="mark('ok')" id="okButton">OK</button>
       <button onclick="mark('skip')">Skip</button>
       <button onclick="prev()">⟵ Prev</button>
       <button onclick="next()">Next ⟶</button>
+      <button onclick="promptGo()">Go…</button>
       <button id="bboxToggle" onclick="toggleBBoxMode()">BBox Edit: Off</button>
+    </div>
+    <div class="row">
+      <button onclick="setFilter('')" class="{{ '' if filter_mode else 'active' }}">All</button>
+      <button onclick="setFilter('empty')" class="{{ 'active' if filter_mode == 'empty' else '' }}">Missing labels</button>
     </div>
     {% if has_data %}
     <p>KP: drag dots; <b>double-click</b> to seed nose & ears at the cursor; hold <b>T</b> and click to toggle visibility.</p>
     <p>BBox: click <b>BBox Edit</b> to enable moving/resizing; drag inside to move, drag corners to resize; if none exists, <b>click-drag</b> while edit mode is on (or use numeric fields).</p>
+    <p>Shortcuts: press <b>R</b> to remove the current bbox/label entry; use <b>Go…</b> to jump to an image by index or relative path; click <b>Empty Label</b> to generate an all-zero negative label.</p>
     {% else %}
     <p class="warning">No images found. Provide valid directories above.</p>
     {% endif %}
@@ -536,6 +573,8 @@ TEMPLATE = """
       </div>
       <div class="row">
         <button onclick="promptLabelPath()">Set Label Path…</button>
+        <button onclick="createEmptyLabel()">Empty Label</button>
+        <button onclick="mark('ok')">OK</button>
       </div>
     </div>
   </div>
@@ -557,10 +596,36 @@ const imagesRoot = {{ images_root|tojson }};
 const labelsRoot = {{ labels_root|tojson }};
 const splitName = {{ split|tojson }};
 const hasData = {{ has_data|tojson }};
+const filterMode = {{ filter_mode|tojson }};
+const nextIdx = {{ next_idx }};
+const prevIdx = {{ prev_idx }};
 
 let toggling = false;
 document.addEventListener('keydown', (e)=>{ if(e.key==='t' || e.key==='T') toggling=true; });
 document.addEventListener('keyup',   (e)=>{ if(e.key==='t' || e.key==='T') toggling=false; });
+document.addEventListener('keydown', (e)=>{
+  if (!hasData) return;
+  if (e.repeat) return;
+  const tag = (e.target && e.target.tagName ? e.target.tagName.toLowerCase() : '');
+  if (tag === 'input' || tag === 'textarea') return;
+  if (e.key === 'r' || e.key === 'R') {
+    e.preventDefault();
+    removeBBox();
+    return;
+  }
+  if (e.key === 'Escape') {
+    if (bboxEdit) {
+      e.preventDefault();
+      toggleBBoxMode(false);
+    }
+    return;
+  }
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    mark('ok');
+    return;
+  }
+});
 
 const raw = document.getElementById('raw');
 const canvas = document.getElementById('canvas');
@@ -668,9 +733,13 @@ function toImgCoords(evt){
   return {x,y};
 }
 
-function toggleBBoxMode(){
+function toggleBBoxMode(force){
   if(!hasData) return;
-  bboxEdit = !bboxEdit;
+  if (typeof force === 'boolean') {
+    bboxEdit = force;
+  } else {
+    bboxEdit = !bboxEdit;
+  }
   const btn = document.getElementById('bboxToggle');
   if(bboxEdit){
     btn.textContent = 'BBox Edit: On';
@@ -981,8 +1050,35 @@ async function mark(kind){
   next();
 }
 
-function next(){ window.location = "{{ url_for('index') }}?i="+(idx+1)+"&img_dir="+encodeURIComponent(imagesRoot)+"&lbl_dir="+encodeURIComponent(labelsRoot)+"&split="+encodeURIComponent(splitName); }
-function prev(){ window.location = "{{ url_for('index') }}?i="+(idx-1)+"&img_dir="+encodeURIComponent(imagesRoot)+"&lbl_dir="+encodeURIComponent(labelsRoot)+"&split="+encodeURIComponent(splitName); }
+function applyFilterParams(url){
+  if (filterMode){
+    url.searchParams.set('filter', filterMode);
+  } else {
+    url.searchParams.delete('filter');
+  }
+}
+
+function next(){
+  if(!hasData) return;
+  const url = new URL("{{ url_for('index') }}", window.location.origin);
+  url.searchParams.set('i', nextIdx);
+  url.searchParams.set('img_dir', imagesRoot);
+  url.searchParams.set('lbl_dir', labelsRoot);
+  url.searchParams.set('split', splitName);
+  applyFilterParams(url);
+  window.location = url.toString();
+}
+
+function prev(){
+  if(!hasData) return;
+  const url = new URL("{{ url_for('index') }}", window.location.origin);
+  url.searchParams.set('i', prevIdx);
+  url.searchParams.set('img_dir', imagesRoot);
+  url.searchParams.set('lbl_dir', labelsRoot);
+  url.searchParams.set('split', splitName);
+  applyFilterParams(url);
+  window.location = url.toString();
+}
 
 function promptLabelPath(){
   if(!hasData) return;
@@ -1002,6 +1098,68 @@ function promptLabelPath(){
     fetch(actionUrl,{method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({i: idx, action:'set_label_path', path: nextPath})}).then(()=>loadState());
   }
+}
+
+async function createEmptyLabel(){
+  if (!hasData) return;
+  const res = await fetch(actionUrl, {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({i: idx, action:'empty_label'})});
+  if (!res.ok) return;
+  const data = await res.json();
+  if (data.ok){
+    await loadState();
+  } else if (data.msg){
+    alert(data.msg);
+  }
+}
+
+function promptGo(){
+  if (!hasData) return;
+  const response = prompt('Go to image (index or relative path from images dir):', '');
+  if (!response) return;
+  const value = response.trim();
+  if (!value) return;
+  const url = new URL(window.location.href);
+  url.searchParams.set('img_dir', imagesRoot);
+  url.searchParams.set('lbl_dir', labelsRoot);
+  url.searchParams.set('split', splitName);
+  if (/^-?\\d+$/.test(value)){
+    url.searchParams.set('i', value);
+    url.searchParams.delete('image');
+  } else {
+    url.searchParams.set('image', value);
+    url.searchParams.delete('i');
+  }
+  applyFilterParams(url);
+  window.location.href = url.toString();
+}
+
+async function removeBBox(){
+  if (!hasData) return;
+  const res = await fetch(actionUrl, {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({i: idx, action:'remove_bbox'})});
+  if (!res.ok) return;
+  const data = await res.json();
+  if (data.ok){
+    await loadState();
+  } else if (data.msg){
+    alert(data.msg);
+  }
+}
+
+function setFilter(mode){
+  const url = new URL(window.location.href);
+  url.searchParams.set('img_dir', imagesRoot);
+  url.searchParams.set('lbl_dir', labelsRoot);
+  url.searchParams.set('split', splitName);
+  if (mode){
+    url.searchParams.set('filter', mode);
+  } else {
+    url.searchParams.delete('filter');
+  }
+  url.searchParams.delete('i');
+  url.searchParams.delete('image');
+  window.location = url.toString();
 }
 </script>
 
@@ -1041,6 +1199,7 @@ def index():
     lbl_dir_param = request.args.get("lbl_dir")
     image_param = request.args.get("image")
     split_param = request.args.get("split")
+    filter_param = request.args.get("filter", "")
 
     new_images_root = CURRENT_IMAGES_ROOT
     new_labels_root = CURRENT_LABELS_ROOT
@@ -1051,26 +1210,45 @@ def index():
     if img_dir_param or lbl_dir_param or split_param:
         refresh_paths(new_images_root, new_labels_root, preview_split=split_param or CACHE_SPLIT)
 
-    total = reviewed = remaining = 0
+    filtered_indices = list(range(len(PAIRS)))
+    if filter_param == "empty":
+        filtered_indices = [i for i, pair in enumerate(PAIRS) if label_is_empty(pair.lbl)]
+
+    display_total = len(filtered_indices)
+    has_data = display_total > 0
+
     context_pair = None
     img_url = ""
     state_url = ""
-    idx = 0
-    if PAIRS:
-        idx = _resolve_index(request.args.get("i") or image_param)
-        context_pair = PAIRS[idx]
-        total, reviewed, remaining, ok, skip = get_counts()
-        img_url = url_for("image_raw", i=idx)
-        state_url = url_for("state_json", i=idx)
+    global_idx = 0
+    display_pos = 0
+    display_remaining = max(display_total - 1, 0)
+    next_idx = prev_idx = 0
 
+    if has_data:
+        global_idx = _resolve_index(request.args.get("i") or image_param)
+        if global_idx not in filtered_indices:
+            global_idx = filtered_indices[0]
+        display_pos = filtered_indices.index(global_idx)
+        display_remaining = max(display_total - display_pos - 1, 0)
+        context_pair = PAIRS[global_idx]
+        img_url = url_for("image_raw", i=global_idx)
+        state_url = url_for("state_json", i=global_idx)
+        next_idx = filtered_indices[min(display_pos + 1, display_total - 1)]
+        prev_idx = filtered_indices[max(display_pos - 1, 0)]
+
+    total_all = reviewed_all = remaining_all = 0
     if PAIRS:
-        total, reviewed, remaining, ok, skip = get_counts()
+        total_all, reviewed_all, remaining_all, ok, skip = get_counts()
+    else:
+        ok = skip = set()
 
     return render_template_string(
         TEMPLATE,
-        idx=idx,
-        total=total,
-        remaining=remaining,
+        idx=global_idx,
+        display_pos=display_pos,
+        total=display_total,
+        remaining=display_remaining,
         imgname=context_pair.img.name if context_pair else "(no images)",
         img_url=img_url,
         state_url=state_url,
@@ -1083,8 +1261,14 @@ def index():
         images_root=str(CURRENT_IMAGES_ROOT),
         labels_root=str(CURRENT_LABELS_ROOT),
         split=CACHE_SPLIT,
-        has_data=bool(PAIRS),
-        current_image=str(context_pair.img) if context_pair else ""
+        has_data=has_data,
+        current_image=str(context_pair.img) if context_pair else "",
+        filter_mode=filter_param,
+        next_idx=next_idx,
+        prev_idx=prev_idx,
+        total_all=total_all,
+        remaining_all=remaining_all,
+        reviewed_all=reviewed_all,
     )
 
 @APP.route("/raw/<int:i>.png")
@@ -1214,6 +1398,25 @@ def action():
         new_path.parent.mkdir(parents=True, exist_ok=True)
         pair.lbl = new_path
         return jsonify(ok=True, path=str(new_path))
+
+    if act == "remove_bbox":
+        tokens = read_label(pair.lbl)
+        ensure_backup(pair.lbl)
+        if tokens:
+            tokens = [zero_label_tokens() for _ in tokens]
+        else:
+            tokens = [zero_label_tokens()]
+        write_label(pair.lbl, tokens)
+        im2 = render_overlay(pair)
+        cv2.imwrite(str(OUT_PREVIEW / pair.img.name), im2)
+        return jsonify(ok=True)
+
+    if act == "empty_label":
+        ensure_backup(pair.lbl)
+        write_label(pair.lbl, [zero_label_tokens()])
+        im2 = render_overlay(pair)
+        cv2.imwrite(str(OUT_PREVIEW / pair.img.name), im2)
+        return jsonify(ok=True)
 
     # progress
     if act in ("ok","skip"):

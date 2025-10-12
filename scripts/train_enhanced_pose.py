@@ -1,199 +1,220 @@
 #!/usr/bin/env python3
-"""Enhanced YOLO pose training script."""
+"""Fast embedding training script - adds embedding head to existing YOLO model."""
 
-import os
 import sys
+import torch
+import torch.nn as nn
+import torch.optim as optim
 from pathlib import Path
 from ultralytics import YOLO
-import torch
+import numpy as np
+from tqdm import tqdm
+import json
+
+# Add lib to path
+script_dir = Path(__file__).parent.absolute()
+project_root = script_dir.parent
+lib_dir = project_root / "lib"
+sys.path.insert(0, str(lib_dir))
+
+from lizard_tracking.models.embedding_pose import SimpleEmbeddingHead, EmbeddingMemory
+
+def extract_pose_features(yolo_model, image_path):
+    """Extract POSE COORDINATES + VISIBILITY (9 values) for embedding."""
+    results = yolo_model(image_path, verbose=False)
+    
+    if results and len(results[0].keypoints.data) > 0:
+        # Get the pose keypoints with visibility: [nose_x, nose_y, nose_v, ear1_x, ear1_y, ear1_v, ear2_x, ear2_y, ear2_v]
+        kpts = results[0].keypoints.data[0].cpu().numpy()  # Shape: (3, 3) for x,y,visibility
+        
+        # Get image dimensions for normalization
+        img_height, img_width = results[0].orig_shape
+        
+        # Normalize coordinates to [0, 1] range for better training
+        normalized_kpts = kpts.copy()
+        normalized_kpts[:, 0] /= img_width   # Normalize x coordinates
+        normalized_kpts[:, 1] /= img_height  # Normalize y coordinates
+        # Keep visibility flags as is (already 0-1 range)
+        
+        # Return flattened features: [nose_x, nose_y, nose_v, ear1_x, ear1_y, ear1_v, ear2_x, ear2_y, ear2_v]
+        return torch.tensor(normalized_kpts.flatten(), dtype=torch.float32)  # Shape: (9,)
+    
+    return torch.zeros(9, dtype=torch.float32)  # No detection found
+
+def compute_contrastive_loss(embeddings, labels, temperature=0.1):
+    """Simple contrastive loss for similar poses."""
+    # Normalize embeddings
+    embeddings = nn.functional.normalize(embeddings, p=2, dim=1)
+    
+    # Compute similarity matrix
+    sim_matrix = torch.matmul(embeddings, embeddings.t()) / temperature
+    
+    # Create positive pairs (same label)
+    batch_size = embeddings.size(0)
+    labels = labels.contiguous().view(-1, 1)
+    mask = torch.eq(labels, labels.t()).float()
+    
+    # Remove diagonal (self-similarity)
+    mask = mask - torch.eye(batch_size, device=embeddings.device)
+    
+    # Compute contrastive loss
+    exp_sim = torch.exp(sim_matrix)
+    log_prob = sim_matrix - torch.log(exp_sim.sum(dim=1, keepdim=True))
+    
+    # Mean over positive pairs
+    mean_log_prob_pos = (mask * log_prob).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+    loss = -mean_log_prob_pos.mean()
+    
+    return loss
 
 def train_enhanced_pose():
-    """Train enhanced YOLO pose model."""
+    """Train embedding head on top of existing YOLO model for gap filling."""
+    
+    print("🚀 Fast Embedding Training")
+    print("=" * 40)
+    print("🎯 IMPORTANT: Embeddings are computed on POSE COORDINATES")
+    print("   Flow: Image → YOLO → Pose Keypoints → Embedding Vector")
+    print("   NOT: Image → Embedding (we embed pose shapes, not raw pixels)")
+    print()
     
     # Configuration
-    project_root = Path("/a/home/cc/students/neurosci/bareketd1/sandbox/lizard-tracking")
-    dataset_dir = project_root / "dataset"
-    output_dir = project_root / "output/models/enhanced_pose"
+    base_model_path = project_root / "output/models/head_pose/best.pt"
+    dataset_dir = project_root / "dataset/embedding_dataset"
+    output_dir = project_root / "output/models/head_embeddings"
     
-    # Training parameters
-    epochs = 150
-    batch_size = 16
-    base_model = "yolo11n-pose.pt"
-    patience = 25
+    embedding_dim = 64
+    learning_rate = 0.001
+    epochs = 20  # Fast training!
+    batch_size = 8
     
-    print("🚀 Starting Enhanced YOLO Pose Model Training")
-    print("=" * 50)
-    print(f"Project: {project_root}")
-    print(f"Dataset: {dataset_dir}")
-    print(f"Output: {output_dir}")
-    print(f"Base model: {base_model}")
-    print(f"Epochs: {epochs}")
-    print(f"Batch size: {batch_size}")
+    print(f"📁 Base model: {base_model_path}")
+    print(f"📁 Dataset: {dataset_dir}")
+    print(f"📁 Output: {output_dir}")
+    print(f"🧠 Embedding dim: {embedding_dim}")
+    print(f"⚡ Epochs: {epochs} (fast mode)")
     print()
+    
+    # Check if base model exists
+    if not base_model_path.exists():
+        print(f"❌ Base model not found: {base_model_path}")
+        print("   Please train a base YOLO model first")
+        sys.exit(1)
+    
+    # Check dataset
+    if not dataset_dir.exists():
+        print(f"❌ Dataset not found: {dataset_dir}")
+        sys.exit(1)
     
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Count dataset
-    total_images = len(list((dataset_dir / "images").rglob("*.jpg")))  # Recursive search
-    total_labels = len(list((dataset_dir / "labels").rglob("*.txt")))  # Recursive search
+    # Load YOLO model (frozen for feature extraction)
+    print("🔧 Loading base YOLO model...")
+    yolo_model = YOLO(str(base_model_path))
     
-    print("📊 Dataset Statistics:")
-    print(f"   Images: {total_images}")
-    print(f"   Labels: {total_labels}")
-    if total_images > 0:
-        print(f"   Coverage: {total_labels * 100 // total_images}%")
-    else:
-        print("   Coverage: No images found!")
+    # Freeze YOLO parameters (we only train the embedding head)
+    for param in yolo_model.model.parameters():
+        param.requires_grad = False
+    
+    print("✅ YOLO model loaded and frozen")
+    
+    # Create embedding head (input: 9 values from YOLO → output: embedding_dim vector)
+    print("🧠 Creating embedding head...")
+    embedding_head = SimpleEmbeddingHead(input_dim=9, embedding_dim=embedding_dim)  # 3 keypoints * 3 values (x,y,v)
+    optimizer = optim.Adam(embedding_head.parameters(), lr=learning_rate)
+    
+    # Get training images
+    images_dir = dataset_dir / "images"
+    image_files = list(images_dir.rglob("*.jpg"))[:100]  # Use first 100 for fast training
+    
+    print(f"📊 Training on {len(image_files)} images")
     print()
     
-    # Create enhanced dataset YAML
-    yaml_content = f"""# Enhanced pose dataset configuration
-path: {dataset_dir}
-train: images
-val: images
-
-# Classes
-names:
-  0: lizard_head
-
-# Keypoints (nose, ear_left, ear_right)
-kpt_shape: [3, 2]
-
-# Keypoint flip indices for horizontal flip augmentation
-# For horizontal flip: nose stays same (0), left ear (1) ↔ right ear (2)
-flip_idx: [0, 2, 1]
-
-# Enhanced training augmentations
-hsv_h: 0.015      # Hue augmentation (fraction)
-hsv_s: 0.7        # Saturation augmentation (fraction)
-hsv_v: 0.4        # Value augmentation (fraction)
-degrees: 15.0     # Rotation degrees
-translate: 0.1    # Translation (fraction)
-scale: 0.5        # Scale augmentation (fraction)
-shear: 0.0        # Shear (degrees)
-perspective: 0.0  # Perspective (probability)
-flipud: 0.0       # Vertical flip probability
-fliplr: 0.5       # Horizontal flip probability
-mosaic: 1.0       # Mosaic probability
-mixup: 0.2        # Mixup probability
-copy_paste: 0.1   # Copy-paste probability
-"""
+    # Training loop
+    print("🏋️ Starting embedding training...")
+    embedding_head.train()
     
-    yaml_path = output_dir / "enhanced_pose.yaml"
-    with open(yaml_path, 'w') as f:
-        f.write(yaml_content)
-    
-    print("✅ Configuration created")
-    print()
-    
-    # Training configuration
-    print("🔧 Training configuration:")
-    device_name = torch.cuda.get_device_name() if torch.cuda.is_available() else "CPU"
-    print(f"   Device: {device_name}")
-    print(f"   CUDA available: {torch.cuda.is_available()}")
-    print()
-    
-    # Load and train model
-    print("🧠 Starting enhanced training...")
-    model = YOLO(base_model)
-    
-    try:
-        results = model.train(
-            data=str(yaml_path),
-            epochs=epochs,
-            batch=batch_size,
-            imgsz=640,
-            device='auto',
-            
-            # Learning rate schedule
-            lr0=0.01,
-            lrf=0.001,
-            momentum=0.937,
-            weight_decay=0.0005,
-            warmup_epochs=3,
-            warmup_momentum=0.8,
-            warmup_bias_lr=0.1,
-            
-            # Advanced training settings
-            patience=patience,
-            save_period=10,
-            
-            # Validation settings
-            val=True,
-            plots=True,
-            save_json=True,
-            
-            # Output settings
-            project=str(output_dir),
-            name='enhanced_training',
-            exist_ok=True,
-            
-            # Loss weights (optimized for pose)
-            box=7.5,
-            cls=0.5,
-            pose=12.0,
-            kobj=1.0,
-            
-            # Advanced augmentations
-            copy_paste=0.1,
-            mixup=0.2,
-            mosaic=1.0,
-            
-            # Multi-scale training
-            rect=False,
-            
-            # Optimizer
-            optimizer='AdamW',
-            cos_lr=True
-        )
+    for epoch in range(epochs):
+        total_loss = 0
+        num_batches = 0
         
-        print("✅ Training completed!")
-        print(f"📊 Best fitness: {getattr(results, 'best_fitness', 'N/A')}")
-        print(f"📁 Model saved to: {results.save_dir}")
+        # Simple batch processing
+        for i in tqdm(range(0, len(image_files), batch_size), desc=f"Epoch {epoch+1}/{epochs}"):
+            batch_files = image_files[i:i+batch_size]
+            
+            # Extract features and create embeddings
+            batch_features = []
+            batch_labels = []
+            
+            for img_file in batch_files:
+                features = extract_pose_features(yolo_model, str(img_file))
+                if features.sum() > 0:  # Only use images with detected poses
+                    batch_features.append(features)
+                    batch_labels.append(0)  # All same class for now
+            
+            if len(batch_features) < 2:
+                continue
+            
+            # Convert to tensors
+            features_tensor = torch.stack(batch_features)
+            labels_tensor = torch.tensor(batch_labels)
+            
+            # Generate embeddings
+            embeddings = embedding_head(features_tensor)
+            
+            # Compute contrastive loss
+            loss = compute_contrastive_loss(embeddings, labels_tensor)
+            
+            # Backpropagation
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            num_batches += 1
         
-        # Find best model
-        best_model_path = Path(results.save_dir) / "weights" / "best.pt"
-        if best_model_path.exists():
-            print(f"🎯 Best model: {best_model_path}")
-            
-            # Quick validation
-            print("📊 Running quick validation...")
-            model_best = YOLO(str(best_model_path))
-            val_results = model_best.val(data=str(yaml_path), plots=False, verbose=False)
-            
-            print("📈 Validation Results:")
-            print(f"   Box mAP50: {val_results.box.map50:.4f}")
-            print(f"   Box mAP50-95: {val_results.box.map:.4f}")
-            
-            if hasattr(val_results, 'pose') and val_results.pose:
-                print(f"   Pose mAP50: {val_results.pose.map50:.4f}")
-                print(f"   Pose mAP50-95: {val_results.pose.map:.4f}")
-            
-            print()
-            print("🎉 ENHANCED TRAINING COMPLETED!")
-            print("=" * 50)
-            print(f"📁 Enhanced model: {best_model_path}")
-            print()
-            print("🔗 To use the enhanced model, update your .env file:")
-            print(f"   MODEL_PATH={best_model_path}")
-            print()
-            print("✨ Enhanced model improvements:")
-            print("   ✓ Advanced data augmentation")
-            print("   ✓ Optimized hyperparameters")
-            print("   ✓ Better loss weighting for pose detection")
-            print("   ✓ Longer training with patience")
-            print("   ✓ AdamW optimizer with cosine learning rate")
-            
-            return str(best_model_path)
-        else:
-            print("⚠️ Best model not found!")
-            return None
-            
-    except Exception as e:
-        print(f"❌ Training failed: {e}")
-        return None
-
+        avg_loss = total_loss / max(num_batches, 1)
+        print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
+    
+    print("✅ Training completed!")
+    
+    # Save embedding head
+    embedding_path = output_dir / "embedding_head.pt"
+    torch.save({
+        'embedding_head_state_dict': embedding_head.state_dict(),
+        'embedding_dim': embedding_dim,
+        'base_model_path': str(base_model_path),
+        'input_dim': 9,  # 3 keypoints * 3 values (x, y, visibility)
+    }, embedding_path)
+    
+    print(f"💾 Embedding head saved: {embedding_path}")
+    
+    # Create combined model info
+    model_info = {
+        'base_model': str(base_model_path),
+        'embedding_head': str(embedding_path),
+        'embedding_dim': embedding_dim,
+        'input_dim': 9,  # 3 keypoints * 3 values (x, y, visibility)
+        'training_epochs': epochs,
+        'training_images': len(image_files),
+        'purpose': 'gap_filling_and_temporal_consistency'
+    }
+    
+    info_path = output_dir / "model_info.json"
+    with open(info_path, 'w') as f:
+        json.dump(model_info, f, indent=2)
+    
+    print(f"📋 Model info saved: {info_path}")
+    print()
+    print("🎯 Embedding model ready for gap filling!")
+    print("   Usage in arena_mock_app:")
+    print(f"   - Base YOLO model: {base_model_path}")
+    print(f"   - Embedding head: {embedding_path}")
+    print("   - Input: 9D pose features (x,y,visibility for 3 keypoints)")
+    print("   - Output: 64D embedding vector")
+    print("   - When detection fails → find similar embedding → recover pose")
+    print()
+    print("✅ Training complete!")
 
 if __name__ == "__main__":
     train_enhanced_pose()
