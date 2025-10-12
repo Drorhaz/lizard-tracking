@@ -86,6 +86,9 @@ python lib/behavioral_analysis/detector.py
 # Web interface for pose detection and behavioral analysis
 cd pose-head/pipeline && python web_interface.py
 ```
+Inference & FPS check
+After training, run inference + latency profiling:
+
 
 ### 5) Offline video tracking
 ```bash
@@ -96,6 +99,7 @@ python lib/lizard_tracking/api.py --track \
 This produces a CSV (and optional parquet) plus an overlay video under `output/`.
 
 ### 6) Live demo / UI smoke-test
+
 ```bash
 python -m lizard_tracking.ui.stream --source 0 --weights runs/pose/pogona_head_pose2/weights/best.pt
 ```
