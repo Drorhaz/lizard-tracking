@@ -10,9 +10,12 @@ import torch
 def train_enhanced_pose():
     """Train enhanced YOLO pose model."""
     
-    # Configuration
-    project_root = Path("/a/home/cc/students/neurosci/bareketd1/sandbox/lizard-tracking")
-    dataset_dir = project_root / "dataset"
+    # Get script directory and project root using relative paths
+    script_dir = Path(__file__).parent.absolute()
+    project_root = script_dir.parent
+    
+    # Configuration - use embedding dataset
+    dataset_dir = project_root / "embedding_dataset"
     output_dir = project_root / "output/models/enhanced_pose"
     
     # Training parameters
@@ -31,6 +34,12 @@ def train_enhanced_pose():
     print(f"Batch size: {batch_size}")
     print()
     
+    # Check if embedding dataset exists
+    if not dataset_dir.exists():
+        print(f"❌ Embedding dataset not found at: {dataset_dir}")
+        print("   Please run convert_labels.py first to create the embedding dataset")
+        sys.exit(1)
+    
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
     
@@ -45,9 +54,8 @@ def train_enhanced_pose():
         print(f"   Coverage: {total_labels * 100 // total_images}%")
     else:
         print("   Coverage: No images found!")
+        sys.exit(1)
     print()
-    
-    # Create enhanced dataset YAML
     yaml_content = f"""# Enhanced pose dataset configuration
 path: {dataset_dir}
 train: images
