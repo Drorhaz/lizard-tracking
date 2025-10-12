@@ -1,6 +1,7 @@
 """Embedding-enhanced pose model for temporal consistency and gap filling."""
 from __future__ import annotations
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -132,12 +133,13 @@ class EmbeddingEnhancedPoseModel:
         self,
         base_model: PogonaHeadPoseModel,
         embedding_dim: int = 64,
+        input_dim: int = 9,  # Default for pose coordinates (3 keypoints × 3 values)
         memory_size: int = 30,
         min_confidence: float = 0.3,
         enable_gap_filling: bool = True
     ):
         self.base_model = base_model
-        self.embedding_head = SimpleEmbeddingHead(embedding_dim=embedding_dim)
+        self.embedding_head = SimpleEmbeddingHead(input_dim=input_dim, embedding_dim=embedding_dim)
         self.memory = EmbeddingMemory(max_size=memory_size)
         self.min_confidence = min_confidence
         self.enable_gap_filling = enable_gap_filling
@@ -245,6 +247,42 @@ class EmbeddingEnhancedPoseModel:
             filled_from_embedding=False
         )
     
+    def predict(self, frame, conf=None, verbose=False):
+        """Compatibility method that mimics YOLO's predict interface."""
+        try:
+            # Use embedding-enhanced prediction
+            embedding_output = self.predict_with_embeddings(frame)
+            
+            # Convert to YOLO-style results format
+            if embedding_output and embedding_output.pose_output:
+                # Create a mock YOLO result object
+                class MockResult:
+                    def __init__(self, pose_output):
+                        self.boxes = None
+                        self.keypoints = None
+                        if pose_output.boxes is not None:
+                            # Mock boxes object
+                            class MockBoxes:
+                                def __init__(self, boxes, confs):
+                                    self.xyxy = torch.tensor(boxes) if boxes is not None else None
+                                    self.conf = torch.tensor(confs) if confs is not None else None
+                            self.boxes = MockBoxes(pose_output.boxes, pose_output.confs)
+                        
+                        if pose_output.keypoints is not None:
+                            # Mock keypoints object
+                            class MockKeypoints:
+                                def __init__(self, keypoints):
+                                    self.xy = torch.tensor(keypoints) if keypoints is not None else None
+                            self.keypoints = MockKeypoints(pose_output.keypoints)
+                
+                return [MockResult(embedding_output.pose_output)]
+            else:
+                return []
+        except Exception as e:
+            print(f"⚠️ Embedding prediction failed: {e}")
+            # Fallback to base model
+            return self.base_model.model.predict(frame, conf=conf, verbose=verbose)
+    
     def reset_memory(self):
         """Reset the embedding memory (e.g., between videos)."""
         self.memory = EmbeddingMemory(max_size=self.memory.max_size)
@@ -255,13 +293,39 @@ class EmbeddingEnhancedPoseModel:
 def create_embedding_enhanced_model(
     weights_path: str,
     embedding_dim: int = 64,
+    input_dim: int = 9,  # Default for pose coordinates
     enable_gap_filling: bool = True,
+    embedding_head_path: Optional[str] = None,
     **kwargs
 ) -> EmbeddingEnhancedPoseModel:
     """Factory function to create embedding-enhanced pose model."""
     base_model = PogonaHeadPoseModel(weights_path, **kwargs)
-    return EmbeddingEnhancedPoseModel(
+    model = EmbeddingEnhancedPoseModel(
         base_model=base_model,
         embedding_dim=embedding_dim,
+        input_dim=input_dim,
         enable_gap_filling=enable_gap_filling
     )
+    
+    # Load pre-trained embedding head if provided
+    if embedding_head_path and os.path.exists(embedding_head_path):
+        try:
+            checkpoint = torch.load(embedding_head_path, map_location='cpu', weights_only=False)
+            
+            # Handle different save formats
+            if isinstance(checkpoint, dict) and 'embedding_head_state_dict' in checkpoint:
+                # Saved with metadata (from training script)
+                state_dict = checkpoint['embedding_head_state_dict']
+                embedding_dim = checkpoint.get('embedding_dim', 64)
+                print(f"📊 Loading embedding head: dim={embedding_dim}")
+            else:
+                # Direct state dict save
+                state_dict = checkpoint
+            
+            model.embedding_head.load_state_dict(state_dict)
+            print(f"✅ Loaded pre-trained embedding head from {embedding_head_path}")
+        except Exception as e:
+            print(f"⚠️ Failed to load embedding head from {embedding_head_path}: {e}")
+            print("Using randomly initialized embedding head instead")
+    
+    return model
