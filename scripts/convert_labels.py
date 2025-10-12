@@ -20,8 +20,9 @@ def convert_pose_labels(source_dataset_dir, output_dataset_name="embedding_datas
         print(f"❌ Images directory not found: {images_dir}")
         return
     
-    # Create embedding dataset directory
-    embedding_dataset_path = source_path.parent / output_dataset_name
+    # Create embedding dataset directory inside the dataset folder
+    dataset_parent = source_path.parent  # This should be 'dataset' folder
+    embedding_dataset_path = dataset_parent / output_dataset_name
     embedding_labels_dir = embedding_dataset_path / "labels"
     embedding_images_dir = embedding_dataset_path / "images"
     
@@ -119,6 +120,6 @@ def convert_pose_labels(source_dataset_dir, output_dataset_name="embedding_datas
 
 
 if __name__ == "__main__":
-    # Use relative path from scripts directory
-    dataset_dir = "../dataset"
+    # Use dataset/pose as the source
+    dataset_dir = "../dataset/pose"
     convert_pose_labels(dataset_dir)
