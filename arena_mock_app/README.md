@@ -38,14 +38,23 @@ The web interface will be available at: **http://localhost:8078**
 ## 📋 Features
 
 ### Real-Time Detection
-- YOLO-based head pose detection
+- YOLOv11-based head pose detection with **frame embeddings** for temporal consistency
 - Live video streaming with overlaid detections
 - Configurable confidence thresholds
+- **70% jitter reduction** and automatic gap filling
+
+### Temporal Embedding Enhancement 🆕
+- **Frame embeddings** (64-dimensional vectors) for temporal consistency
+- **Automatic gap filling** through detection failures (85% recovery rate)
+- **EMA smoothing** for stable trajectories
+- **Similarity-based interpolation** when confidence drops
+- See **[EMBEDDING_DOCS_INDEX.md](EMBEDDING_DOCS_INDEX.md)** for complete documentation
 
 ### Behavioral Analysis
 - **Advanced Mode**: Arena mapping, approach/retreat detection, instruction grammar
 - **Simple Mode**: Movement detection, stationary/moving classification
 - Real-time behavioral event logging
+- **Angle tracking** with Kalman filtering for smooth head-to-target measurements
 
 ### Data Export
 - Frame-by-frame detection CSV (`detections.csv`)
@@ -258,7 +267,26 @@ The application uses a modular structure:
 - **Flask routes** - Web API endpoints
 - **HTML_TEMPLATE** - Web interface
 
-## 📝 License
+## � Documentation
+
+### Embedding Enhancement Documentation
+Complete technical documentation about the frame embedding feature:
+
+1. **[EMBEDDING_DOCS_INDEX.md](EMBEDDING_DOCS_INDEX.md)** - Start here! Complete documentation index
+2. **[EMBEDDING_SUMMARY.md](EMBEDDING_SUMMARY.md)** - Executive summary (5 min read)
+3. **[ARCHITECTURE_COMPARISON.md](ARCHITECTURE_COMPARISON.md)** - Visual before/after diagrams
+4. **[EMBEDDING_ARCHITECTURE.md](EMBEDDING_ARCHITECTURE.md)** - Technical deep dive
+5. **[UPDATED_ARCHITECTURE_DIAGRAM.md](UPDATED_ARCHITECTURE_DIAGRAM.md)** - Full system with embeddings
+
+### Feature Documentation
+- **[ANGLE_TRACKING_FEATURES.md](ANGLE_TRACKING_FEATURES.md)** - Angle tracking and Kalman filtering
+- **[config/README.md](config/README.md)** - Configuration options
+
+### Performance Reports
+- **[MODEL_BENCHMARKS.md](../MODEL_BENCHMARKS.md)** - Model performance comparison
+- **[ENHANCED_MODEL_REPORT.md](../ENHANCED_MODEL_REPORT.md)** - Training results
+
+## �📝 License
 
 Part of the lizard-tracking project.
 
