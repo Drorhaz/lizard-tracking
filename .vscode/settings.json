@@ -1,0 +1,26 @@
+{
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    "python-envs.pythonProjects": [],
+    "workbench.colorCustomizations": {
+        "activityBar.activeBackground": "#6a91ab",
+        "activityBar.background": "#6a91ab",
+        "activityBar.foreground": "#15202b",
+        "activityBar.inactiveForeground": "#15202b99",
+        "activityBarBadge.background": "#ddc2d2",
+        "activityBarBadge.foreground": "#15202b",
+        "commandCenter.border": "#e7e7e799",
+        "sash.hoverBorder": "#6a91ab",
+        "statusBar.background": "#517791",
+        "statusBar.foreground": "#e7e7e7",
+        "statusBarItem.hoverBackground": "#6a91ab",
+        "statusBarItem.remoteBackground": "#517791",
+        "statusBarItem.remoteForeground": "#e7e7e7",
+        "titleBar.activeBackground": "#517791",
+        "titleBar.activeForeground": "#e7e7e7",
+        "titleBar.inactiveBackground": "#51779199",
+        "titleBar.inactiveForeground": "#e7e7e799"
+    },
+    "peacock.remoteColor": "#517791",
+    "git.enabled": true,
+}

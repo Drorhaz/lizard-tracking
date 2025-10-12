@@ -6,3 +6,24 @@ runs/
 dataset/
 !dataset/README.md
 *.pt
+
+
+output/*
+!output/models/
+!output/compare/
+!output/detections/top_20250916T150021-20251001T004728
+*backup*
+!/a/home/cc/students/neurosci/bareketd1/sandbox/lizard-tracking/output/models/enhanced_pose
+!output/detections/top_20250916T150021-20251010T044014
+
+*.env
+*/config/.env
+pose-head/config/.env
+pose-head/config/.env
+pose-head/REORGANIZATION_COMPLETE.md
+pose-head/PORTABLE_MIGRATION_COMPLETE.md
+pose-head/NAMING_COMPLETE.md
+
+# SLURM scripts with sensitive account info
+scripts/*.sbatch
+!scripts/*.sbatch.example
