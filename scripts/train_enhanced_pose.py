@@ -15,7 +15,7 @@ def train_enhanced_pose():
     project_root = script_dir.parent
     
     # Configuration - use embedding dataset
-    dataset_dir = project_root / "embedding_dataset"
+    dataset_dir = project_root / "dataset" / "embedding_dataset"
     output_dir = project_root / "output/models/enhanced_pose"
     
     # Training parameters
