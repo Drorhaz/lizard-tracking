@@ -1,0 +1,12 @@
+# Embedding pose dataset configuration (without visibility flags)
+path: ../dataset/embedding_dataset
+train: images/train
+val: images/val
+
+names:
+  0: pogona_head
+
+# Keypoints without visibility flags: [x, y] format only
+kpt_shape: [3, 2]
+kpt_label: [nose, ear_left, ear_right]
+flip_idx: [0, 2, 1]
