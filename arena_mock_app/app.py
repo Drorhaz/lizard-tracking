@@ -1145,7 +1145,7 @@ class SimpleHeadPoseDetector:
         
         # Add angle information overlay in top-right corner
         if self.smoothed_angle is not None:
-            angle_text = f"Angle to {self.config.target_line}: {self.smoothed_angle:.1f}°"
+            angle_text = f"Angle to {self.config.target_line}: {self.smoothed_angle:.1f}`"
             # Position in top-right corner
             text_size = cv2.getTextSize(angle_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
             text_x = frame_width - text_size[0] - 10
