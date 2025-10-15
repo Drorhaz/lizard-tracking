@@ -50,6 +50,11 @@ DEFAULT_BOX = 0.07  # default normalized side length for seeded heads
 # ======================================================
 
 IMG_EXTS = {".jpg",".jpeg",".png",".bmp",".tif",".tiff"}
+QUEUE_MANIFEST = Path("data/review_queue/queue.jsonl")
+QUEUE_IMAGES_FALLBACK = Path("dataset/review_queue/images")
+QUEUE_LABELS_FALLBACK = Path("dataset/review_queue/labels")
+
+QUEUE_MODE = False
 OUT_PREVIEW.mkdir(parents=True, exist_ok=True)
 LOG_OK.parent.mkdir(parents=True, exist_ok=True)
 LOG_SKIP.parent.mkdir(parents=True, exist_ok=True)
@@ -77,22 +82,119 @@ def list_pairs(img_root: Path, lbl_root: Path) -> List[Pair]:
     return pairs
 
 
-def refresh_paths(images_root: Path, labels_root: Path, *, preview_split: Optional[str] = None) -> None:
-    global CURRENT_IMAGES_ROOT, CURRENT_LABELS_ROOT, OUT_PREVIEW, LOG_OK, LOG_SKIP, CACHE_SPLIT, PAIRS
+def set_environment(images_root: Path, labels_root: Path, *, preview_split: Optional[str] = None, queue_mode: bool = False) -> None:
+    global CURRENT_IMAGES_ROOT, CURRENT_LABELS_ROOT, OUT_PREVIEW, LOG_OK, LOG_SKIP, CACHE_SPLIT, QUEUE_MODE
     CURRENT_IMAGES_ROOT = images_root.resolve()
     CURRENT_LABELS_ROOT = labels_root.resolve()
     split = preview_split if preview_split is not None else CACHE_SPLIT
     CACHE_SPLIT = split
+    QUEUE_MODE = queue_mode
     OUT_PREVIEW = (OUT_PREVIEW_ROOT / split).resolve()
     LOG_OK = (LOG_OK_ROOT / f"{split}_ok.txt").resolve()
     LOG_SKIP = (LOG_SKIP_ROOT / f"{split}_skip.txt").resolve()
     OUT_PREVIEW.mkdir(parents=True, exist_ok=True)
     LOG_OK.parent.mkdir(parents=True, exist_ok=True)
     LOG_SKIP.parent.mkdir(parents=True, exist_ok=True)
+
+
+def refresh_paths(images_root: Path, labels_root: Path, *, preview_split: Optional[str] = None) -> None:
+    global PAIRS
+    set_environment(images_root, labels_root, preview_split=preview_split, queue_mode=False)
     PAIRS = list_pairs(CURRENT_IMAGES_ROOT, CURRENT_LABELS_ROOT)
 
+
+def derive_label_path_from_image(img_path: Path) -> Path:
+    parts = img_path.parts
+    try:
+        idx = parts.index("images")
+    except ValueError:
+        return img_path.with_suffix(".txt")
+    base = Path(*parts[:idx]) / "labels"
+    rel = Path(*parts[idx + 1:]).with_suffix(".txt")
+    return (base / rel)
+
+
+def load_queue_manifest(manifest_path: Path) -> List[Pair]:
+    entries: List[Pair] = []
+    if not manifest_path.exists():
+        return entries
+    seen: set[str] = set()
+    with manifest_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            img_ref = payload.get("image") or payload.get("frame")
+            if not img_ref:
+                continue
+            img_path = Path(img_ref).expanduser()
+            img_abs = img_path.resolve()
+            lbl_ref = payload.get("label")
+            label_path = Path(lbl_ref).expanduser() if lbl_ref else derive_label_path_from_image(img_path)
+            lbl_abs = label_path.resolve()
+            key = str(img_abs)
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append(Pair(img=img_abs, lbl=lbl_abs))
+    return entries
+
+
+def read_manifest_json(manifest_path: Path) -> List[dict]:
+  entries: List[dict] = []
+  if not manifest_path.exists():
+    return entries
+  with manifest_path.open("r", encoding="utf-8") as fh:
+    for line in fh:
+      line = line.strip()
+      if not line:
+        continue
+      try:
+        payload = json.loads(line)
+      except json.JSONDecodeError:
+        continue
+      entries.append(payload)
+  return entries
+
+
+def write_manifest_json(manifest_path: Path, entries: List[dict]) -> None:
+  manifest_path.parent.mkdir(parents=True, exist_ok=True)
+  with manifest_path.open("w", encoding="utf-8") as fh:
+    for e in entries:
+      fh.write(json.dumps(e) + "\n")
+
+
+def _common_parent(paths: List[Path], fallback: Path) -> Path:
+    valid = [str(p) for p in paths if p]
+    if not valid:
+        return fallback.resolve()
+    try:
+        return Path(os.path.commonpath(valid)).resolve()
+    except ValueError:
+        return fallback.resolve()
+
+
+def activate_queue(manifest_path: Path) -> None:
+    global PAIRS
+    pairs = load_queue_manifest(manifest_path)
+    img_root = _common_parent([pair.img.parent for pair in pairs], QUEUE_IMAGES_FALLBACK)
+    lbl_root = _common_parent([pair.lbl.parent for pair in pairs], QUEUE_LABELS_FALLBACK)
+    set_environment(img_root, lbl_root, preview_split="queue", queue_mode=True)
+    PAIRS = pairs
+
 CACHE_SPLIT = DEFAULT_SPLIT
-PAIRS: List[Pair] = []
+PAIRS = []  # List[Pair] - removed type annotation to avoid global declaration conflicts
+
+# Store last used keypoint offsets and bbox properties for seeding new poses
+LAST_NOSE_OFFSET = (0.0, 0.0)  # relative to seed click point
+LAST_LEFT_OFFSET = (-0.25, 0.15)  # default: left and down from nose
+LAST_RIGHT_OFFSET = (0.25, 0.15)  # default: right and down from nose
+LAST_BBOX_SIZE = (0.3, 0.3)  # (width, height) - default bbox size
+LAST_BBOX_OFFSET = (0.0, 0.0)  # bbox center offset from seed click point
 
 refresh_paths(DEFAULT_IMAGES_ROOT, DEFAULT_LABELS_ROOT, preview_split=DEFAULT_SPLIT)
 
@@ -249,6 +351,29 @@ def img_to_png_bytes(im: np.ndarray) -> bytes:
 def normalized_from_pixels(px: float, py: float, W: int, H: int):
     return max(0,min(1, px/W)), max(0,min(1, py/H))
 
+def update_last_keypoint_offsets(nose: Keypoint, left: Keypoint, right: Keypoint) -> None:
+    """Update the global last used keypoint offsets based on current pose."""
+    global LAST_NOSE_OFFSET, LAST_LEFT_OFFSET, LAST_RIGHT_OFFSET
+    
+    # Calculate offsets relative to the nose position
+    nose_x, nose_y = nose[0], nose[1]
+    LAST_NOSE_OFFSET = (0.0, 0.0)  # nose is always at the reference point
+    LAST_LEFT_OFFSET = (left[0] - nose_x, left[1] - nose_y)
+    LAST_RIGHT_OFFSET = (right[0] - nose_x, right[1] - nose_y)
+
+
+def update_last_bbox_pattern(cx: float, cy: float, w: float, h: float, nose: Keypoint) -> None:
+    """Update the global last used bbox size and offset based on current pose."""
+    global LAST_BBOX_SIZE, LAST_BBOX_OFFSET
+    
+    # Store bbox size
+    LAST_BBOX_SIZE = (w, h)
+    
+    # Calculate bbox center offset relative to nose position
+    nose_x, nose_y = nose[0], nose[1]
+    LAST_BBOX_OFFSET = (cx - nose_x, cy - nose_y)
+
+
 def clamp01(z: float) -> float:
     return max(0.0, min(1.0, float(z)))
 
@@ -301,25 +426,22 @@ def commit_edit(pair: Pair, edit: Dict[str, Any]) -> bool:
     def drop_conf():
         meta.pop("nose_conf", None)
 
-    # seeding from scratch or reseeding: place keypoints around click, leaving bbox untouched
+    # seeding from scratch or reseeding: place keypoints and bbox using last used pattern
     if "seed_template" in edit:
         seed = edit["seed_template"]
         seed_x = float(seed.get("x", W / 2))
         seed_y = float(seed.get("y", H / 2))
         nx, ny = normalized_from_pixels(seed_x, seed_y, W, H)
 
-        # Seed a triangular pose inside the bbox and adjust bbox around it
-        base_span = max(w, h, DEFAULT_BOX)
-        bbox_side = clamp01(base_span * 1.2)
-        cx, cy = nx, ny
-        w = h = bbox_side
-
-        ear_offset_x = clamp01(bbox_side * 0.25)
-        ear_offset_y = clamp01(bbox_side * 0.15)
-
+        # Use last used keypoint offsets for consistent placement
         nose = (nx, ny, 2.0)
-        left = (clamp01(nx - ear_offset_x), clamp01(ny + ear_offset_y), 2.0)
-        right = (clamp01(nx + ear_offset_x), clamp01(ny + ear_offset_y), 2.0)
+        left = (clamp01(nx + LAST_LEFT_OFFSET[0]), clamp01(ny + LAST_LEFT_OFFSET[1]), 2.0)
+        right = (clamp01(nx + LAST_RIGHT_OFFSET[0]), clamp01(ny + LAST_RIGHT_OFFSET[1]), 2.0)
+
+        # Use last used bbox size and offset
+        w, h = LAST_BBOX_SIZE
+        cx = clamp01(nx + LAST_BBOX_OFFSET[0])
+        cy = clamp01(ny + LAST_BBOX_OFFSET[1])
 
         meta = {}
         new_t = format_pose_tokens(cls_id, cx, cy, w, h, nose, left, right, include_visibility=True, extras=meta)
@@ -423,6 +545,10 @@ def commit_edit(pair: Pair, edit: Dict[str, Any]) -> bool:
     tokens[0] = new_t
     write_label(pair.lbl, tokens)
 
+    # Update last used keypoint and bbox pattern for future seeding
+    update_last_keypoint_offsets(nose, L, R)
+    update_last_bbox_pattern(cx, cy, w, h, nose)
+
     # preview
     im2 = render_overlay(pair)
     cv2.imwrite(str(OUT_PREVIEW/pair.img.name), im2)
@@ -507,12 +633,22 @@ TEMPLATE = """
   <label>Labels dir <input type="text" name="lbl_dir" value="{{ labels_root }}"></label>
   <label>Split <input type="text" name="split" value="{{ split }}" style="width:120px"></label>
   <input type="hidden" name="filter" value="{{ filter_mode }}">
+  <input type="hidden" name="mode" value="{{ mode }}">
   <label>Image <input type="text" name="image" placeholder="path/to/image" value="{{ current_image }}" style="width:280px"></label>
   <button type="submit">Load</button>
   {% if has_data %}
     <input type="hidden" name="i" value="{{ idx }}">
   {% endif %}
 </form>
+
+<div class="row">
+  {% if mode == 'queue' %}
+    <span class="warning">Review queue mode active.</span>
+    <a href="{{ url_for('index', mode='dirs') }}">Switch to directories</a>
+  {% else %}
+    <a href="{{ url_for('index', mode='queue') }}">Load review queue</a>
+  {% endif %}
+</div>
 
 <div class="wrap">
   <div class="left panel">
@@ -597,6 +733,7 @@ const labelsRoot = {{ labels_root|tojson }};
 const splitName = {{ split|tojson }};
 const hasData = {{ has_data|tojson }};
 const filterMode = {{ filter_mode|tojson }};
+const modeName = {{ mode|tojson }};
 const nextIdx = {{ next_idx }};
 const prevIdx = {{ prev_idx }};
 
@@ -623,6 +760,11 @@ document.addEventListener('keydown', (e)=>{
   if (e.key === 'Enter') {
     e.preventDefault();
     mark('ok');
+    return;
+  }
+  if (e.key === ' ') {  // Spacebar toggles bbox editing mode
+    e.preventDefault();
+    toggleBBoxMode();
     return;
   }
 });
@@ -1056,6 +1198,11 @@ function applyFilterParams(url){
   } else {
     url.searchParams.delete('filter');
   }
+  if (modeName){
+    url.searchParams.set('mode', modeName);
+  } else {
+    url.searchParams.delete('mode');
+  }
 }
 
 function next(){
@@ -1147,13 +1294,18 @@ async function removeBBox(){
   }
 }
 
-function setFilter(mode){
+function setFilter(filter){
   const url = new URL(window.location.href);
   url.searchParams.set('img_dir', imagesRoot);
   url.searchParams.set('lbl_dir', labelsRoot);
   url.searchParams.set('split', splitName);
-  if (mode){
-    url.searchParams.set('filter', mode);
+  if (modeName){
+    url.searchParams.set('mode', modeName);
+  } else {
+    url.searchParams.delete('mode');
+  }
+  if (filter){
+    url.searchParams.set('filter', filter);
   } else {
     url.searchParams.delete('filter');
   }
@@ -1195,20 +1347,28 @@ def _resolve_index(target: Optional[str]) -> int:
 
 @APP.route("/")
 def index():
+    mode_param = request.args.get("mode")
+    target_mode = mode_param or ("queue" if QUEUE_MODE else "dirs")
+
     img_dir_param = request.args.get("img_dir")
     lbl_dir_param = request.args.get("lbl_dir")
     image_param = request.args.get("image")
     split_param = request.args.get("split")
     filter_param = request.args.get("filter", "")
 
-    new_images_root = CURRENT_IMAGES_ROOT
-    new_labels_root = CURRENT_LABELS_ROOT
-    if img_dir_param:
-        new_images_root = Path(img_dir_param).expanduser().resolve()
-    if lbl_dir_param:
-        new_labels_root = Path(lbl_dir_param).expanduser().resolve()
-    if img_dir_param or lbl_dir_param or split_param:
-        refresh_paths(new_images_root, new_labels_root, preview_split=split_param or CACHE_SPLIT)
+    if target_mode == "queue":
+        activate_queue(QUEUE_MANIFEST)
+    else:
+        if QUEUE_MODE:
+            refresh_paths(DEFAULT_IMAGES_ROOT, DEFAULT_LABELS_ROOT, preview_split=DEFAULT_SPLIT)
+        new_images_root = CURRENT_IMAGES_ROOT
+        new_labels_root = CURRENT_LABELS_ROOT
+        if img_dir_param:
+            new_images_root = Path(img_dir_param).expanduser().resolve()
+        if lbl_dir_param:
+            new_labels_root = Path(lbl_dir_param).expanduser().resolve()
+        if img_dir_param or lbl_dir_param or split_param:
+            refresh_paths(new_images_root, new_labels_root, preview_split=split_param or CACHE_SPLIT)
 
     filtered_indices = list(range(len(PAIRS)))
     if filter_param == "empty":
@@ -1269,6 +1429,7 @@ def index():
         total_all=total_all,
         remaining_all=remaining_all,
         reviewed_all=reviewed_all,
+        mode=target_mode,
     )
 
 @APP.route("/raw/<int:i>.png")
