@@ -1,0 +1,8 @@
+path: /scratch200/bar/lizard-tracking/dataset/pose-seed
+train: images/train
+val: images/val
+
+nc: 1
+names:
+  0: lizard_head
+kpt_shape: [3, 3]
