@@ -3,7 +3,7 @@
 Head Pose Detection Application
 =====================================
 Features:
-- Regular YOLO pose detection (no embedding models)
+- Regular YOLO pose detection
 - Advanced behavioral analysis with arena mapping
 - Head angle calculation with Kalman filtering
 - Real-time visual overlays (angle, direction arrow)
@@ -545,11 +545,6 @@ def ensure_run_dir(output_base: str, source: str) -> Path:
     (run / "frames_to_review" / "labels").mkdir(parents=True, exist_ok=True)  # Low confidence labels
     (run / "high_conf" / "images").mkdir(parents=True, exist_ok=True)         # High confidence frames
     (run / "high_conf" / "labels").mkdir(parents=True, exist_ok=True)         # High confidence labels
-    # Optical flow tracking directories
-    (run / "optical_flow" / "images").mkdir(parents=True, exist_ok=True)      # Optical flow tracked frames
-    (run / "optical_flow" / "labels").mkdir(parents=True, exist_ok=True)      # Optical flow generated labels
-    (run / "optical_flow_rescue" / "images").mkdir(parents=True, exist_ok=True)  # Rescue tracked frames
-    (run / "optical_flow_rescue" / "labels").mkdir(parents=True, exist_ok=True)  # Rescue generated labels
     return run
 
 def save_run_config(run_dir: Path, cfg: dict):
