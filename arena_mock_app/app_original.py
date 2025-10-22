@@ -390,18 +390,26 @@ class PoseObservation:
     def as_row(self) -> Tuple:
         if self.pose is None:
             return (self.frame_index, float("nan"), float("nan"), float("nan"), float("nan"), float("nan"),
-                    float("nan"), float("nan"), float("nan"), float("nan"), float("nan"), float("nan"))
+                    float("nan"), float("nan"), float("nan"), float("nan"), float("nan"), float("nan"),
+                    float("nan"), float("nan"), float("nan"), float("nan"))
         x1,y1,x2,y2 = self.pose.bbox_xyxy
         cx = (x1+x2)/2.0; cy=(y1+y2)/2.0
         # Extract nose coordinates
         nose_x = self.pose.nose[0] if self.pose.nose else float("nan")
         nose_y = self.pose.nose[1] if self.pose.nose else float("nan")
+        # Extract ear coordinates
+        ear_left_x = self.pose.ear_left[0] if self.pose.ear_left else float("nan")
+        ear_left_y = self.pose.ear_left[1] if self.pose.ear_left else float("nan")
+        ear_right_x = self.pose.ear_right[0] if self.pose.ear_right else float("nan")
+        ear_right_y = self.pose.ear_right[1] if self.pose.ear_right else float("nan")
         # Extract angle information if available
         angle = getattr(self.pose, 'angle', float("nan"))
         smoothed_angle = getattr(self.pose, 'smoothed_angle', float("nan"))
-        return (self.frame_index, self.pose.conf, x1, y1, x2, y2, cx, cy, nose_x, nose_y, angle, smoothed_angle)
+        return (self.frame_index, self.pose.conf, x1, y1, x2, y2, cx, cy, nose_x, nose_y, 
+                ear_left_x, ear_left_y, ear_right_x, ear_right_y, angle, smoothed_angle)
 
-CSV_HEADER = ("frame_idx","conf","x1","y1","x2","y2","cx","cy","nose_x","nose_y","angle","smoothed_angle")
+CSV_HEADER = ("frame_idx","conf","x1","y1","x2","y2","cx","cy","nose_x","nose_y",
+              "ear_left_x","ear_left_y","ear_right_x","ear_right_y","angle","smoothed_angle")
 
 def now_tag():
     return datetime.now().strftime("%Y%m%dT%H%M%S")
@@ -805,7 +813,7 @@ class SimpleHeadPoseDetector:
                             
                             # Add angle overlay in top-right corner if enabled
                             if self.config.enable_angle_tracking and self.config.show_angle_overlay and self.smoothed_angle is not None:
-                                angle_text = f"Angle: {self.smoothed_angle:.1f}°"
+                                angle_text = f"Angle: {self.smoothed_angle:.1f}`"
                                 # Position in top-right corner
                                 frame_height, frame_width = frame.shape[:2]
                                 text_size = cv2.getTextSize(angle_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
