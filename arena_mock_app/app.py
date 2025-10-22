@@ -2,14 +2,18 @@
 """
 Head Pose Detection Application
 =====================================
-- NoneType errors eliminated  
-- Simple detection logic
-- Stable streaming
-- Visual feedback with confidence threshold
+Features:
+- Regular YOLO pose detection (no embedding models)
+- Advanced behavioral analysis with arena mapping
+- Head angle calculation with Kalman filtering
+- Real-time visual overlays (angle, direction arrow)
+- Comprehensive data logging and visualization
+- No-detection handling with last event display
+- Stable streaming with confidence-based feedback
 """
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION - Now loaded from config/.env
+# CONFIGURATION - loaded from config/.env
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import cv2
@@ -46,15 +50,6 @@ sys.path.insert(0, parent_dir)
 print(f"🔧 Added to Python path: {lib_dir}")
 print(f"🔧 Added to Python path: {parent_dir}")
 
-# Try to import the embedding model
-try:
-    from lizard_tracking.models.embedding_pose import create_embedding_enhanced_model, EmbeddingOutput
-    EMBEDDING_MODEL_AVAILABLE = True
-    print("✅ Embedding model imported successfully")
-except ImportError as e:
-    EMBEDDING_MODEL_AVAILABLE = False
-    print(f"⚠️ Embedding model not available: {e}")
-
 # Load environment variables from config/.env
 config_path = os.path.join(script_dir, 'config', '.env')
 if os.path.exists(config_path):
@@ -89,6 +84,15 @@ except ImportError as e:
     print(f"⚠️ Behavioral analysis import failed: {e}")
     BEHAVIOR_ANALYSIS_AVAILABLE = False
 
+# Import optical flow tracking
+try:
+    from lizard_tracking.core.optical_flow_tracker import OpticalFlowTracker, TrackingConfig, TrackedPose
+    OPTICAL_FLOW_AVAILABLE = True
+    print("✅ Optical flow tracking imported successfully")
+except ImportError as e:
+    print(f"⚠️ Optical flow tracking import failed: {e}")
+    OPTICAL_FLOW_AVAILABLE = False
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Kalman Filter for Angle Smoothing
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -107,25 +111,25 @@ class AngleKalmanFilter:
         # State: [angle, angular_velocity]
         self.x = np.array([0.0, 0.0])  # Initial state (angle=0, velocity=0)
         
-        # State covariance matrix
-        self.P = np.eye(2) * 1000  # High initial uncertainty
+        # State covariance matrix (uncertainty in our state estimate)
+        self.P = np.eye(2) * 1000  # Large initial uncertainty
         
-        # State transition matrix (constant velocity model)
+        # State transition matrix (how state evolves)
         self.F = np.array([[1.0, 1.0],  # angle = angle + velocity * dt (dt=1 frame)
-                           [0.0, 1.0]])  # velocity = velocity
+                           [0.0, 1.0]]) # velocity = velocity (assume constant velocity)
         
         # Measurement matrix (we only observe angle, not velocity)
         self.H = np.array([[1.0, 0.0]])
         
-        # Process noise covariance
+        # Process noise covariance matrix
         self.Q = np.array([[process_noise, 0.0],
                            [0.0, process_noise]])
         
-        # Measurement noise covariance
+        # Measurement noise covariance matrix
         self.R = np.array([[measurement_noise]])
         
         self.initialized = False
-        
+    
     def update(self, measured_angle):
         """
         Update filter with new angle measurement
@@ -139,171 +143,39 @@ class AngleKalmanFilter:
         if not self.initialized:
             # Initialize with first measurement
             self.x[0] = measured_angle
-            self.x[1] = 0.0  # No initial velocity
             self.initialized = True
             return measured_angle
         
         # Handle angle wraparound (convert to 0-360 range)
-        measured_angle = self._normalize_angle_360(measured_angle)
+        measured_angle = measured_angle % 360
         
-        # Handle angle discontinuity (e.g., 359° to 1°)
-        angle_diff = measured_angle - self.x[0]
-        if angle_diff > 180:
-            measured_angle -= 360
-        elif angle_diff < -180:
-            measured_angle += 360
+        # Predict step
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
         
-        # Prediction step
-        self.x = self.F @ self.x  # Predict next state
-        self.P = self.F @ self.P @ self.F.T + self.Q  # Predict covariance
+        # Handle angle wraparound in prediction
+        self.x[0] = self.x[0] % 360
+        
+        # Calculate innovation (difference between measurement and prediction)
+        y = measured_angle - (self.H @ self.x)[0]
+        
+        # Handle angle wraparound in innovation (choose shortest path)
+        if y > 180:
+            y -= 360
+        elif y < -180:
+            y += 360
         
         # Update step
-        z = np.array([measured_angle])  # Measurement
-        y = z - self.H @ self.x  # Innovation (measurement residual)
-        S = self.H @ self.P @ self.H.T + self.R  # Innovation covariance
-        K = self.P @ self.H.T @ np.linalg.inv(S)  # Kalman gain
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
         
-        self.x = self.x + K @ y  # Update state
-        self.P = (np.eye(2) - K @ self.H) @ self.P  # Update covariance
+        self.x = self.x + K @ np.array([y])
+        self.P = (np.eye(2) - K @ self.H) @ self.P
         
-        # Return smoothed angle normalized to 0-360
-        return self._normalize_angle_360(self.x[0])
-    
-    def _normalize_angle(self, angle):
-        """Normalize angle to [-180, 180] degrees"""
-        while angle > 180:
-            angle -= 360
-        while angle <= -180:
-            angle += 360
-        return angle
-    
-    def _normalize_angle_360(self, angle):
-        """Normalize angle to [0, 360) degrees"""
-        while angle < 0:
-            angle += 360
-        while angle >= 360:
-            angle -= 360
-        return angle
-    
-    def get_angular_velocity(self):
-        """Get estimated angular velocity in degrees per frame"""
-        return self.x[1] if self.initialized else 0.0
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Configuration Management
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class AppConfig:
-    """Application configuration loaded from .env file"""
-    
-    def __init__(self):
-        # Model Configuration
-        self.model_path = os.getenv('MODEL_PATH', '../output/models/head_pose/best.pt')
-        self.confidence_threshold = float(os.getenv('CONFIDENCE_THRESHOLD', '0.2'))
-
-        # Video Input Configuration
-        self.video_path = os.getenv('VIDEO_PATH', '../arena_mock_app/videos/top_20250916T150021.mp4')
-        self.processing_fps = int(os.getenv('PROCESSING_FPS', '60'))
+        # Handle angle wraparound in final result
+        self.x[0] = self.x[0] % 360
         
-        # Output Configuration
-        self.output_dir = os.getenv('OUTPUT_DIR', '../output/detections')
-        self.save_every_n_frames = int(os.getenv('SAVE_EVERY_N_FRAMES', '10'))
-        self.save_every_n_previews = int(os.getenv('SAVE_EVERY_N_PREVIEWS', '30'))
-        self.verbose = os.getenv('VERBOSE', 'false').lower() == 'true'
-        self.detection_iou = float(os.getenv('DETECTION_IOU', '0.5'))
-        self.detection_imgsz = int(os.getenv('DETECTION_IMGSZ', '640'))
-        
-        # Advanced Behavioral Analysis
-        self.target_line = os.getenv('TARGET_LINE', 'right')
-        self.near_max = float(os.getenv('NEAR_MAX', '0.20'))
-        self.middle_max = float(os.getenv('MIDDLE_MAX', '0.30'))
-        self.advance_threshold = float(os.getenv('ADVANCE_THRESHOLD', '0.002'))
-        self.retreat_threshold = float(os.getenv('RETREAT_THRESHOLD', '0.002'))
-        self.x_dir_thresh_norm = float(os.getenv('X_DIR_THRESH_NORM', '0.01'))
-        self.y_dir_thresh_norm = float(os.getenv('Y_DIR_THRESH_NORM', '0.01'))
-        self.head_only_thresh_norm = float(os.getenv('HEAD_ONLY_THRESH_NORM', '0.005'))
-        self.body_move_thresh_norm = float(os.getenv('BODY_MOVE_THRESH_NORM', '0.010'))
-        self.lookback_window = int(os.getenv('LOOKBACK_WINDOW', '5'))
-        
-        # Simple Behavior Detection (Fallback)
-        self.min_moving_frames = int(os.getenv('MIN_MOVING_FRAMES', '3'))
-        self.stop_threshold = float(os.getenv('STOP_THRESHOLD', '300.0'))
-        self.min_stationary_frames = int(os.getenv('MIN_STATIONARY_FRAMES', '3'))
-        
-        # Web Server Configuration
-        self.server_host = os.getenv('SERVER_HOST', '0.0.0.0')
-        self.server_port = int(os.getenv('SERVER_PORT', '8078'))
-        self.server_debug = os.getenv('SERVER_DEBUG', 'false').lower() == 'true'
-        self.stream_fps = int(os.getenv('STREAM_FPS', '15'))
-        self.jpeg_quality = int(os.getenv('JPEG_QUALITY', '85'))
-        self.use_predict_stream = os.getenv('USE_PREDICT_STREAM', 'false').lower() == 'true'
-        self.overlay_event_seconds = float(os.getenv('OVERLAY_EVENT_SECONDS', '2.5'))
-        self.frame_queue_size = int(os.getenv('FRAME_QUEUE_SIZE', '2'))
-        
-        # Video saving with overlays
-        self.save_video_with_overlays = os.getenv('SAVE_VIDEO_WITH_OVERLAYS', 'false').lower() == 'true'
-        self.output_video_fps = float(os.getenv('OUTPUT_VIDEO_FPS', '15.0'))
-        
-        # Embedding-enhanced pose model
-        self.use_embedding_model = os.getenv('USE_EMBEDDING_MODEL', 'false').lower() == 'true'
-        self.embedding_dim = int(os.getenv('EMBEDDING_DIM', '64'))
-        self.embedding_memory_size = int(os.getenv('EMBEDDING_MEMORY_SIZE', '30'))
-        self.embedding_min_confidence = float(os.getenv('EMBEDDING_MIN_CONFIDENCE', '0.3'))
-        self.embedding_similarity_threshold = float(os.getenv('EMBEDDING_SIMILARITY_THRESHOLD', '0.7'))
-    
-    def print_config(self):
-        """Print current configuration"""
-        print("\n" + "="*60)
-        print("📋 CURRENT CONFIGURATION")
-        print("="*60)
-        print(f"🤖 Model: {self.model_path}")
-        print(f"📹 Video: {self.video_path}")
-        print(f"🎯 Confidence: {self.confidence_threshold}")
-        print(f"⚡ Processing FPS: {self.processing_fps}")
-        print(f"💾 Output: {self.output_dir}")
-        print(f"🔊 Verbose: {self.verbose}")
-        print(f"🌐 Server: {self.server_host}:{self.server_port}")
-        print(f"📺 Stream FPS: {self.stream_fps}")
-        print(f"🎬 Save Video with Overlays: {self.save_video_with_overlays}")
-        if self.save_video_with_overlays:
-            print(f"📼 Output Video FPS: {self.output_video_fps}")
-        print(f"🧠 Embedding Model: {self.use_embedding_model}")
-        if self.use_embedding_model:
-            print(f"📊 Embedding Dim: {self.embedding_dim}, Memory: {self.embedding_memory_size}")
-        print("="*60 + "\n")
-
-# Initialize global configuration
-CONFIG = AppConfig()
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Data Classes and File Management (from video_pose_pipeline.py)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@dataclass
-class HeadPose:
-    bbox_xyxy: Tuple[float,float,float,float]
-    conf: float
-    nose: Optional[Tuple[float,float]] = None
-    ear_left: Optional[Tuple[float,float]] = None
-    ear_right: Optional[Tuple[float,float]] = None
-
-@dataclass
-class PoseObservation:
-    frame_index: int
-    pose: Optional[HeadPose]
-
-    def as_row(self) -> Tuple:
-        if self.pose is None:
-            return (self.frame_index, float("nan"), float("nan"), float("nan"), float("nan"), float("nan"),
-                    float("nan"), float("nan"), float("nan"), float("nan"))
-        x1,y1,x2,y2 = self.pose.bbox_xyxy
-        cx = (x1+x2)/2.0; cy=(y1+y2)/2.0
-        # Extract nose coordinates
-        nose_x = self.pose.nose[0] if self.pose.nose else float("nan")
-        nose_y = self.pose.nose[1] if self.pose.nose else float("nan")
-        return (self.frame_index, self.pose.conf, x1, y1, x2, y2, cx, cy, nose_x, nose_y)
-
-CSV_HEADER = ("frame_idx","conf","x1","y1","x2","y2","cx","cy","nose_x","nose_y")
+        return self.x[0]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Angle Calculation Functions
@@ -324,14 +196,14 @@ def calculate_head_angle_to_target(nose, ear_left, ear_right, target_line, targe
         
     Returns:
         tuple: (angle_degrees, head_direction_vector)
-                             angle_degrees: angle in degrees (0-360°)
-                                                         Convention: angle is measured from a vector that is
-                                                         parallel to the target line to the head vector (ears->nose).
-                                                         Therefore:
-                                                             0°   = head vector is parallel to the target line
-                                                             90°  = head vector is perpendicular to the target line (counterclockwise)
-                                                             180° = head vector is parallel but opposite direction
-                                                             270° = head vector is perpendicular to the target line (clockwise)
+               angle_degrees: angle in degrees (0-360°)
+               Convention: angle is measured from a vector that is
+               parallel to the target line to the head vector (ears->nose).
+               Therefore:
+                   0°   = head vector is parallel to the target line
+                   90°  = head vector is perpendicular to the target line (counterclockwise)
+                   180° = head vector is parallel but opposite direction
+                   270° = head vector is perpendicular to the target line (clockwise)
                head_direction_vector: (x, y) normalized vector showing head direction
     """
     if not nose or (not ear_left and not ear_right):
@@ -410,6 +282,247 @@ def get_target_line_position(target_line, frame_width, frame_height):
         return frame_height
     return None
 
+def run_performance_analysis(run_dir_path, config):
+    """Run the performance analysis script on the completed run"""
+    if not config.run_performance_analysis:
+        print("📊 Performance analysis disabled in configuration")
+        return None
+    
+    script_path = os.path.join(os.path.dirname(__file__), config.analysis_script_path)
+    script_path = os.path.abspath(script_path)
+    
+    if not os.path.exists(script_path):
+        print(f"⚠️ Performance analysis script not found: {script_path}")
+        return None
+    
+    print(f"📊 Running performance analysis on: {run_dir_path}")
+    print(f"🔧 Using script: {script_path}")
+    print(f"🎯 Min confidence: {config.analysis_min_confidence}")
+    print(f"📈 Generate plots: {config.analysis_generate_plots}")
+    print(f"⏱️ Seconds per bin: {config.analysis_seconds_per_bin}")
+    
+    try:
+        import subprocess
+        import sys
+        
+        # Build command arguments
+        cmd = [
+            sys.executable,
+            script_path,
+            str(run_dir_path),
+            "--min-confidence", str(config.analysis_min_confidence),
+            "--seconds-per-bin", str(config.analysis_seconds_per_bin)
+        ]
+        
+        # Add --no-plots flag if plots are disabled
+        if not config.analysis_generate_plots:
+            cmd.append("--no-plots")
+        
+        # Run the analysis script
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minute timeout
+        )
+        
+        if result.returncode == 0:
+            print("✅ Performance analysis completed successfully")
+            if result.stdout:
+                # Print relevant output lines
+                for line in result.stdout.split('\n'):
+                    if any(keyword in line.lower() for keyword in ['benchmark', 'summary', 'coverage', 'confidence', 'fps', '✅', '📊', '📈']):
+                        print(f"📊 {line}")
+            return True
+        else:
+            print(f"❌ Performance analysis failed with return code: {result.returncode}")
+            if result.stderr:
+                print(f"Error output: {result.stderr}")
+            if result.stdout:
+                print(f"Standard output: {result.stdout}")
+            return False
+            
+    except subprocess.TimeoutExpired:
+        print("⏰ Performance analysis timed out (>5 minutes)")
+        return False
+    except Exception as e:
+        print(f"❌ Error running performance analysis: {e}")
+        return False
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Configuration Management
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class AppConfig:
+    """Application configuration loaded from .env file"""
+    
+    def __init__(self):
+        # Get relative paths based on script location
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(script_dir)
+        
+        # Model Configuration - use relative paths
+        default_model_path = os.path.join(project_root, 'output', 'models', 'head_pose', 'best.pt')
+        self.model_path = os.getenv('MODEL_PATH', default_model_path)
+        self.confidence_threshold = float(os.getenv('CONFIDENCE_THRESHOLD', '0.2'))
+        self.good_confidence_threshold = float(os.getenv('GOOD_CONFIDENCE_THRESHOLD', '0.8'))
+        
+        # Video Input Configuration - use relative paths
+        default_video_path = os.path.join(script_dir, 'videos', 'top_20250916T150021.mp4')
+        self.video_path = os.getenv('VIDEO_PATH', default_video_path)
+        # Video directory for selection dropdown
+        default_video_dir = os.path.join(script_dir, 'videos')
+        self.video_dir = os.getenv('VIDEO_DIR', default_video_dir)
+        self.processing_fps = int(os.getenv('PROCESSING_FPS', '60'))
+        
+        # Output Configuration
+        self.output_dir = os.getenv('OUTPUT_DIR', '../output/detections')
+        self.save_every_n_frames = int(os.getenv('SAVE_EVERY_N_FRAMES', '10'))
+        self.save_every_n_previews = int(os.getenv('SAVE_EVERY_N_PREVIEWS', '30'))
+        self.verbose = os.getenv('VERBOSE', 'false').lower() == 'true'
+        self.detection_iou = float(os.getenv('DETECTION_IOU', '0.5'))
+        self.detection_imgsz = int(os.getenv('DETECTION_IMGSZ', '640'))
+        
+        # Advanced Behavioral Analysis
+        self.target_line = os.getenv('TARGET_LINE', 'right')
+        self.near_max = float(os.getenv('NEAR_MAX', '0.20'))
+        self.middle_max = float(os.getenv('MIDDLE_MAX', '0.30'))
+        self.advance_threshold = float(os.getenv('ADVANCE_THRESHOLD', '0.002'))
+        self.retreat_threshold = float(os.getenv('RETREAT_THRESHOLD', '0.002'))
+        self.x_dir_thresh_norm = float(os.getenv('X_DIR_THRESH_NORM', '0.01'))
+        self.y_dir_thresh_norm = float(os.getenv('Y_DIR_THRESH_NORM', '0.01'))
+        self.head_only_thresh_norm = float(os.getenv('HEAD_ONLY_THRESH_NORM', '0.005'))
+        self.body_move_thresh_norm = float(os.getenv('BODY_MOVE_THRESH_NORM', '0.010'))
+        self.lookback_window = int(os.getenv('LOOKBACK_WINDOW', '5'))
+        
+        # Optical Flow Tracking Configuration
+        self.enable_optical_flow = os.getenv('ENABLE_OPTICAL_FLOW', 'true').lower() == 'true'
+        self.optical_flow_confidence_threshold = float(os.getenv('OPTICAL_FLOW_CONF_THRESHOLD', '0.4'))
+        self.optical_flow_max_track_length = int(os.getenv('OPTICAL_FLOW_MAX_TRACK_LENGTH', '8'))
+        self.optical_flow_confidence_boost = float(os.getenv('OPTICAL_FLOW_CONF_BOOST', '0.2'))
+        
+        # Optical Flow Frame Saving Configuration
+        self.save_optical_flow_frames = os.getenv('SAVE_OPTICAL_FLOW_FRAMES', 'true').lower() == 'true'
+        self.save_every_n_optical_flow = int(os.getenv('SAVE_EVERY_N_OPTICAL_FLOW', '1'))  # Save every frame by default
+        
+        # Simple Behavior Detection (Fallback)
+        self.min_moving_frames = int(os.getenv('MIN_MOVING_FRAMES', '3'))
+        self.stop_threshold = float(os.getenv('STOP_THRESHOLD', '300.0'))
+        self.min_stationary_frames = int(os.getenv('MIN_STATIONARY_FRAMES', '3'))
+        
+        # Web Server Configuration
+        self.server_host = os.getenv('SERVER_HOST', '0.0.0.0')
+        self.server_port = int(os.getenv('SERVER_PORT', '8078'))
+        self.server_debug = os.getenv('SERVER_DEBUG', 'false').lower() == 'true'
+        self.stream_fps = int(os.getenv('STREAM_FPS', '15'))
+        self.jpeg_quality = int(os.getenv('JPEG_QUALITY', '85'))
+        self.use_predict_stream = os.getenv('USE_PREDICT_STREAM', 'false').lower() == 'true'
+        self.overlay_event_seconds = float(os.getenv('OVERLAY_EVENT_SECONDS', '2.5'))
+        self.frame_queue_size = int(os.getenv('FRAME_QUEUE_SIZE', '2'))
+        
+        # Video saving with overlays
+        self.save_video_with_overlays = os.getenv('SAVE_VIDEO_WITH_OVERLAYS', 'false').lower() == 'true'
+        self.output_video_fps = float(os.getenv('OUTPUT_VIDEO_FPS', '15.0'))
+        
+        # Angle Tracking Configuration
+        self.enable_angle_tracking = os.getenv('ENABLE_ANGLE_TRACKING', 'true').lower() == 'true'
+        self.angle_kalman_process_noise = float(os.getenv('ANGLE_KALMAN_PROCESS_NOISE', '1e-4'))
+        self.angle_kalman_measurement_noise = float(os.getenv('ANGLE_KALMAN_MEASUREMENT_NOISE', '1e-1'))
+        self.show_angle_overlay = os.getenv('SHOW_ANGLE_OVERLAY', 'true').lower() == 'true'
+        self.show_head_direction_arrow = os.getenv('SHOW_HEAD_DIRECTION_ARROW', 'true').lower() == 'true'
+        
+        # Performance Analysis Configuration
+        self.run_performance_analysis = os.getenv('RUN_PERFORMANCE_ANALYSIS', 'true').lower() == 'true'
+        self.analysis_script_path = os.getenv('ANALYSIS_SCRIPT_PATH', '../scripts/analyze_realworld_benchmark.py')
+        self.analysis_min_confidence = float(os.getenv('ANALYSIS_MIN_CONFIDENCE', '0.05'))
+        self.analysis_generate_plots = os.getenv('ANALYSIS_GENERATE_PLOTS', 'true').lower() == 'true'
+        self.analysis_seconds_per_bin = int(os.getenv('ANALYSIS_SECONDS_PER_BIN', '15'))
+    
+    def print_config(self):
+        """Print current configuration"""
+        print("\n" + "="*60)
+        print("📋 CURRENT CONFIGURATION")
+        print("="*60)
+        print(f"🤖 Model: {self.model_path}")
+        print(f"📹 Video: {self.video_path}")
+        print(f"🎯 Confidence: {self.confidence_threshold}")
+        print(f"⭐ Good Confidence: {self.good_confidence_threshold}")
+        print(f"⚡ Processing FPS: {self.processing_fps}")
+        print(f"💾 Output: {self.output_dir}")
+        print(f"🔊 Verbose: {self.verbose}")
+        print(f"🌐 Server: {self.server_host}:{self.server_port}")
+        print(f"📺 Stream FPS: {self.stream_fps}")
+        print(f"🎬 Save Video with Overlays: {self.save_video_with_overlays}")
+        if self.save_video_with_overlays:
+            print(f"📼 Output Video FPS: {self.output_video_fps}")
+        print(f"📐 Angle Tracking: {self.enable_angle_tracking}")
+        if self.enable_angle_tracking:
+            print(f"🎯 Target Line: {self.target_line}")
+            print(f"📊 Show Angle Overlay: {self.show_angle_overlay}")
+            print(f"🏹 Show Direction Arrow: {self.show_head_direction_arrow}")
+        print(f"📊 Performance Analysis: {self.run_performance_analysis}")
+        if self.run_performance_analysis:
+            print(f"📈 Analysis Script: {self.analysis_script_path}")
+            print(f"🎯 Analysis Min Confidence: {self.analysis_min_confidence}")
+            print(f"📈 Generate Plots: {self.analysis_generate_plots}")
+            print(f"⏱️ Seconds Per Bin: {self.analysis_seconds_per_bin}")
+        print(f"🔄 Optical Flow Tracking: {self.enable_optical_flow}")
+        if self.enable_optical_flow:
+            print(f"🎯 OF Confidence Threshold: {self.optical_flow_confidence_threshold}")
+            print(f"📏 OF Max Track Length: {self.optical_flow_max_track_length} frames")
+            print(f"⚡ OF Confidence Boost: {self.optical_flow_confidence_boost}")
+            print(f"💾 Save OF Frames: {self.save_optical_flow_frames}")
+            if self.save_optical_flow_frames:
+                print(f"📁 Save Every N OF Frames: {self.save_every_n_optical_flow}")
+        print("="*60 + "\n")
+
+# Initialize global configuration
+CONFIG = AppConfig()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Data Classes and File Management (from video_pose_pipeline.py)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class HeadPose:
+    bbox_xyxy: Tuple[float,float,float,float]
+    conf: float
+    nose: Optional[Tuple[float,float]] = None
+    ear_left: Optional[Tuple[float,float]] = None
+    ear_right: Optional[Tuple[float,float]] = None
+    angle: Optional[float] = None  # Raw angle in degrees
+    smoothed_angle: Optional[float] = None  # Kalman-filtered angle
+    head_direction: Optional[Tuple[float,float]] = None  # Normalized direction vector
+
+@dataclass
+class PoseObservation:
+    frame_index: int
+    pose: Optional[HeadPose]
+
+    def as_row(self) -> Tuple:
+        if self.pose is None:
+            return (self.frame_index, float("nan"), float("nan"), float("nan"), float("nan"), float("nan"),
+                    float("nan"), float("nan"), float("nan"), float("nan"), float("nan"), float("nan"),
+                    float("nan"), float("nan"), float("nan"), float("nan"))
+        x1,y1,x2,y2 = self.pose.bbox_xyxy
+        cx = (x1+x2)/2.0; cy=(y1+y2)/2.0
+        # Extract nose coordinates
+        nose_x = self.pose.nose[0] if self.pose.nose else float("nan")
+        nose_y = self.pose.nose[1] if self.pose.nose else float("nan")
+        # Extract ear coordinates
+        ear_left_x = self.pose.ear_left[0] if self.pose.ear_left else float("nan")
+        ear_left_y = self.pose.ear_left[1] if self.pose.ear_left else float("nan")
+        ear_right_x = self.pose.ear_right[0] if self.pose.ear_right else float("nan")
+        ear_right_y = self.pose.ear_right[1] if self.pose.ear_right else float("nan")
+        # Extract angle information if available
+        angle = getattr(self.pose, 'angle', float("nan"))
+        smoothed_angle = getattr(self.pose, 'smoothed_angle', float("nan"))
+        return (self.frame_index, self.pose.conf, x1, y1, x2, y2, cx, cy, nose_x, nose_y, 
+                ear_left_x, ear_left_y, ear_right_x, ear_right_y, angle, smoothed_angle)
+
+CSV_HEADER = ("frame_idx","conf","x1","y1","x2","y2","cx","cy","nose_x","nose_y",
+              "ear_left_x","ear_left_y","ear_right_x","ear_right_y","angle","smoothed_angle")
+
 def now_tag():
     return datetime.now().strftime("%Y%m%dT%H%M%S")
 
@@ -427,12 +540,96 @@ def ensure_run_dir(output_base: str, source: str) -> Path:
     (run / "labeled_frames").mkdir(parents=True, exist_ok=True)  # Clean frames for training
     (run / "labels").mkdir(parents=True, exist_ok=True)           # YOLO txt labels
     (run / "preview_frames").mkdir(parents=True, exist_ok=True)   # Frames WITH drawings
+    # Confidence-based directories
+    (run / "frames_to_review" / "images").mkdir(parents=True, exist_ok=True)  # Low confidence frames
+    (run / "frames_to_review" / "labels").mkdir(parents=True, exist_ok=True)  # Low confidence labels
+    (run / "high_conf" / "images").mkdir(parents=True, exist_ok=True)         # High confidence frames
+    (run / "high_conf" / "labels").mkdir(parents=True, exist_ok=True)         # High confidence labels
+    # Optical flow tracking directories
+    (run / "optical_flow" / "images").mkdir(parents=True, exist_ok=True)      # Optical flow tracked frames
+    (run / "optical_flow" / "labels").mkdir(parents=True, exist_ok=True)      # Optical flow generated labels
+    (run / "optical_flow_rescue" / "images").mkdir(parents=True, exist_ok=True)  # Rescue tracked frames
+    (run / "optical_flow_rescue" / "labels").mkdir(parents=True, exist_ok=True)  # Rescue generated labels
     return run
 
 def save_run_config(run_dir: Path, cfg: dict):
     """Save configuration snapshot"""
     with open(run_dir / "run_config.json", "w") as fp:
         json.dump(cfg, fp, indent=2)
+
+def save_optical_flow_frame_and_label(run_dir: Path, frame: np.ndarray, tracked_pose, 
+                                     frame_count: int, is_rescue: bool = False):
+    """Save optical flow tracked frame and generate YOLO label"""
+    if not tracked_pose or not tracked_pose.bbox:
+        return
+    
+    # Determine subdirectory based on tracking type
+    subdir = "optical_flow_rescue" if is_rescue else "optical_flow"
+    
+    # Save frame
+    frame_name = f"frame{frame_count:08d}.jpg"
+    frame_path = run_dir / subdir / "images" / frame_name
+    cv2.imwrite(str(frame_path), frame)
+    
+    # Generate YOLO label from tracked pose
+    frame_height, frame_width = frame.shape[:2]
+    label_path = run_dir / subdir / "labels" / f"frame{frame_count:08d}.txt"
+    
+    # Create keypoints list from tracked pose as tuples (x, y, vis)
+    keypoints = []
+    if tracked_pose.nose:
+        keypoints.append((tracked_pose.nose[0], tracked_pose.nose[1], 2))  # 2 = visible
+    else:
+        keypoints.append((0, 0, 0))  # 0 = not visible
+
+    if tracked_pose.ear_left:
+        keypoints.append((tracked_pose.ear_left[0], tracked_pose.ear_left[1], 2))
+    else:
+        keypoints.append((0, 0, 0))
+
+    if tracked_pose.ear_right:
+        keypoints.append((tracked_pose.ear_right[0], tracked_pose.ear_right[1], 2))
+    else:
+        keypoints.append((0, 0, 0))
+    
+    # Save label with tracking metadata in comment
+    save_yolo_label_txt(
+        label_path, 
+        cls_id=0,  # Head pose class
+        bbox_xyxy=tracked_pose.bbox,
+        img_w=frame_width,
+        img_h=frame_height,
+        conf=tracked_pose.confidence,
+        keypoints=keypoints
+    )
+    
+    # Add tracking metadata as comment in label file
+    with open(label_path, 'a') as f:
+        f.write(f"\n# Optical Flow Tracking Metadata\n")
+        f.write(f"# is_tracked: {tracked_pose.is_tracked}\n")
+        f.write(f"# tracking_quality: {tracked_pose.tracking_quality:.4f}\n")
+        f.write(f"# frame_number: {tracked_pose.frame_number}\n")
+        f.write(f"# is_rescue: {is_rescue}\n")
+        f.write(f"# of_confidence: {tracked_pose.confidence:.4f}\n")
+
+        # If the tracked_pose contains an original YOLO confidence or bbox, include it
+        orig_conf = getattr(tracked_pose, 'original_confidence', None)
+        orig_bbox = getattr(tracked_pose, 'original_bbox', None)
+        if orig_conf is not None:
+            f.write(f"# original_yolo_confidence: {orig_conf:.4f}\n")
+        if orig_bbox is not None:
+            f.write(f"# original_yolo_bbox_xyxy: {orig_bbox}\n")
+
+    # Also save a raw (no overlays) image copy for the same frame so user has clean frames
+    raw_frame_name = f"frame{frame_count:08d}_raw.jpg"
+    raw_frame_path = run_dir / subdir / "images" / raw_frame_name
+    try:
+        cv2.imwrite(str(raw_frame_path), frame if frame is not None else frame)
+    except Exception:
+        # If frame contains overlays, try to reconstruct raw from latest_raw_frame on detector
+        pass
+    
+    return frame_path, label_path
 
 def save_yolo_label_txt(path_txt: Path, cls_id: int, bbox_xyxy: Tuple[float,float,float,float], 
                        img_w: int, img_h: int, conf: Optional[float] = None, 
@@ -483,6 +680,7 @@ class SimpleHeadPoseDetector:
         self.model = None
         self.cap = None
         self.running = False
+        self.video_completed = False  # Track if video reached end
         self.latest_frame = None
         self.frame_lock = threading.Lock()
         self.current_frame_number = 0
@@ -503,8 +701,6 @@ class SimpleHeadPoseDetector:
         self.stream_time_log = deque(maxlen=120)
         self.last_event_overlay = None
         self.last_event_time = 0.0
-        self.last_detected = None  # Store last detected behavioral event for low confidence display
-        self.last_behavioral_instruction = None  # Store last meaningful behavioral instruction
         self.frame_reader_thread = None
         self.detection_thread = None
         self.stream_target_fps = config.stream_fps
@@ -579,7 +775,10 @@ class SimpleHeadPoseDetector:
         self.output_video_path = None
         
         # Angle tracking with Kalman filtering
-        self.angle_kalman = AngleKalmanFilter(process_noise=1e-4, measurement_noise=1e-1)
+        self.angle_kalman = AngleKalmanFilter(
+            process_noise=config.angle_kalman_process_noise, 
+            measurement_noise=config.angle_kalman_measurement_noise
+        ) if config.enable_angle_tracking else None
         self.current_angle = None
         self.smoothed_angle = None
         self.head_direction = None  # Store normalized head direction vector for arrow display
@@ -587,8 +786,23 @@ class SimpleHeadPoseDetector:
         self.last_detected = None  # Store last detected behavioral event for no-detection handling
         self.last_behavioral_instruction = None  # Store last meaningful behavioral instruction
         
+        # Initialize optical flow tracker
+        self.optical_flow_tracker = None
+        if OPTICAL_FLOW_AVAILABLE and config.enable_optical_flow:
+            tracking_config = TrackingConfig(
+                max_track_length=config.optical_flow_max_track_length,
+                confidence_boost=config.optical_flow_confidence_boost,
+                min_track_quality=0.2,  # Minimum tracking quality threshold
+                max_displacement=80.0,  # Maximum allowed displacement per frame  
+                keypoint_names=['nose', 'ear_left', 'ear_right']
+            )
+            self.optical_flow_tracker = OpticalFlowTracker(tracking_config)
+            print(f"✅ Optical flow tracker initialized (conf_threshold={config.optical_flow_confidence_threshold})")
+        else:
+            print("⚠️ Optical flow tracking disabled or unavailable")
+        
     def load_model(self):
-        """Load YOLO model and optionally wrap with embedding model"""
+        """Load YOLO model"""
         try:
             if torch.cuda.is_available():
                 device = torch.cuda.get_device_name(0)
@@ -598,42 +812,6 @@ class SimpleHeadPoseDetector:
             if torch.cuda.is_available():
                 self.model.to('cuda')
             print("✅ Model loaded on", "cuda" if torch.cuda.is_available() else "cpu")
-            
-            # Initialize embedding-enhanced model if enabled
-            if hasattr(CONFIG, 'use_embedding_model') and CONFIG.use_embedding_model and EMBEDDING_MODEL_AVAILABLE:
-                try:
-                    # Create a simple pose model wrapper for the embedding model
-                    class SimplePoseModel:
-                        def __init__(self, yolo_model):
-                            self.model = yolo_model
-                        
-                        def _extract(self, frame):
-                            results = self.model.predict(frame, conf=CONFIG.confidence_threshold, verbose=False)
-                            if results and len(results) > 0:
-                                res = results[0]
-                                if res.boxes is not None and len(res.boxes) > 0:
-                                    from lizard_tracking.models.embedding_pose import ModelOutput
-                                    return ModelOutput(
-                                        boxes=res.boxes.xyxy.cpu().numpy() if res.boxes.xyxy is not None else None,
-                                        confs=res.boxes.conf.cpu().numpy() if res.boxes.conf is not None else None,
-                                        keypoints=res.keypoints.xy.cpu().numpy() if res.keypoints is not None else None
-                                    )
-                            return None
-                    
-                    base_model = SimplePoseModel(self.model)
-                    self.embedding_model = create_embedding_enhanced_model(
-                        weights_path=self.model_path,
-                        embedding_dim=CONFIG.embedding_dim,
-                        enable_gap_filling=True
-                    )
-                    self.embedding_model.base_model = base_model  # Override with our wrapper
-                    print(f"✅ Embedding model enabled (dim={CONFIG.embedding_dim}, memory={CONFIG.embedding_memory_size})")
-                except Exception as e:
-                    print(f"⚠️ Embedding model failed to initialize: {e}")
-                    self.embedding_model = None
-            else:
-                self.embedding_model = None
-            
             return True
         except Exception as e:
             print(f"❌ Model loading failed: {e}")
@@ -676,12 +854,11 @@ class SimpleHeadPoseDetector:
                 print(f"✅ Advanced detector initialized: {frame_width}x{frame_height} @ {self.capture_fps:.1f} FPS")
             
             # Initialize angle tracking target line position
-            self.target_line_position = get_target_line_position(
-                self.config.target_line, 
-                frame_width, 
-                frame_height
-            )
-            print(f"✅ Angle tracking initialized: target_line={self.config.target_line} at position={self.target_line_position}")
+            if self.config.enable_angle_tracking:
+                self.target_line_position = get_target_line_position(
+                    self.config.target_line, frame_width, frame_height
+                )
+                print(f"✅ Angle tracking enabled: target line '{self.config.target_line}' at position {self.target_line_position}")
             
             print(f"✅ Video loaded: {self.total_frames} frames at {self.capture_fps:.1f} FPS")
             return True
@@ -756,56 +933,15 @@ class SimpleHeadPoseDetector:
         return frame
     
     def detect_poses(self, frame):
-        """Run YOLO detection (with optional embedding enhancement) and draw overlays"""
+        """Run YOLO detection on the provided frame with optical flow fallback and draw overlays"""
         if self.model is None:
             return frame, []
         
+        # Update optical flow tracker with current frame
+        if self.optical_flow_tracker:
+            self.optical_flow_tracker.update_frame(frame)
+        
         try:
-            # Use embedding model if available
-            if hasattr(self, 'embedding_model') and self.embedding_model is not None:
-                try:
-                    embedding_output = self.embedding_model.predict_with_embeddings(frame)
-                    
-                    if embedding_output.pose_output is not None:
-                        # Convert back to YOLO format for drawing
-                        class MockResult:
-                            def __init__(self, pose_output):
-                                self.boxes = MockBoxes(pose_output.boxes, pose_output.confs)
-                                self.keypoints = MockKeypoints(pose_output.keypoints)
-                        
-                        class MockBoxes:
-                            def __init__(self, boxes, confs):
-                                self.xyxy = torch.from_numpy(boxes) if boxes is not None else None
-                                self.conf = torch.from_numpy(confs) if confs is not None else None
-                        
-                        class MockKeypoints:
-                            def __init__(self, keypoints):
-                                self.xy = torch.from_numpy(keypoints) if keypoints is not None else None
-                        
-                        results = [MockResult(embedding_output.pose_output)]
-                        
-                        # Add embedding info to status
-                        if embedding_output.filled_from_embedding:
-                            self.last_event_overlay = f"🧠 EMBEDDING FILL: conf {embedding_output.confidence:.2f}"
-                            self.last_event_time = time.time()
-                        
-                        if self.verbose and embedding_output.filled_from_embedding:
-                            print(f"🧠 Frame {self.current_frame_number}: Filled from embedding (conf: {embedding_output.confidence:.2f})")
-                        
-                        # Continue with normal drawing
-                        frame_with_detection = self.draw_simple_detection(frame, results)
-                        return frame_with_detection, results
-                    else:
-                        results = []
-                        frame_with_detection = frame.copy()
-                        return frame_with_detection, results
-                        
-                except Exception as e:
-                    if self.verbose:
-                        print(f"⚠️ Embedding model error: {e}, falling back to standard detection")
-                    # Fall through to standard detection
-            
-            # Standard YOLO detection
             device_target = 'cuda' if torch.cuda.is_available() else 'cpu'
             detect_iou = self.detection_iou
             detect_imgsz = self.detection_imgsz
@@ -849,17 +985,48 @@ class SimpleHeadPoseDetector:
                             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                             confidence = float(box.conf[0])
                             
-                            # Extract keypoints if available
-                            nose, ear_left, ear_right = None, None, None
-                            if keypoints is not None and len(keypoints.xy) > 0:
-                                kpts = keypoints.xy[0].cpu().numpy()  # First detection keypoints
+                            # Check if we should use optical flow or YOLO detection
+                            use_optical_flow = False
+                            tracked_pose = None
+                            
+                            if (self.optical_flow_tracker and 
+                                confidence < self.config.optical_flow_confidence_threshold):
+                                # Try optical flow tracking for low confidence detections
                                 if self.verbose:
-                                    print(f"🔍 DEBUG: Found {len(kpts)} keypoints: {kpts}")
-                                if len(kpts) >= 3:
-                                    # Extract keypoint coordinates
-                                    kpt0 = (kpts[0][0], kpts[0][1]) if kpts[0][0] > 0 and kpts[0][1] > 0 else None
-                                    kpt1 = (kpts[1][0], kpts[1][1]) if kpts[1][0] > 0 and kpts[1][1] > 0 else None
-                                    kpt2 = (kpts[2][0], kpts[2][1]) if kpts[2][0] > 0 and kpts[2][1] > 0 else None
+                                    print(f"🔍 Low confidence ({confidence:.3f} < {self.config.optical_flow_confidence_threshold:.3f}), attempting optical flow")
+                                
+                                tracked_pose = self.optical_flow_tracker.track_pose(
+                                    frame_number=self.current_frame_number,
+                                    fallback_confidence=confidence
+                                )
+                                
+                                if tracked_pose is not None:
+                                    use_optical_flow = True
+                                    if self.verbose:
+                                        print(f"✅ Optical flow tracking successful (quality: {tracked_pose.tracking_quality:.3f})")
+                            
+                            # Determine final pose data to use
+                            if use_optical_flow and tracked_pose:
+                                # Use optical flow tracked pose
+                                nose = tracked_pose.nose
+                                ear_left = tracked_pose.ear_left
+                                ear_right = tracked_pose.ear_right
+                                final_bbox = tracked_pose.bbox or (x1, y1, x2, y2)
+                                final_confidence = tracked_pose.confidence
+                                is_tracked = True
+                            else:
+                                # Use YOLO detection or initialize tracking for high confidence
+                                # Extract keypoints if available
+                                nose, ear_left, ear_right = None, None, None
+                                if keypoints is not None and len(keypoints.xy) > 0:
+                                    kpts = keypoints.xy[0].cpu().numpy()  # First detection keypoints
+                                    if self.verbose:
+                                        print(f"🔍 DEBUG: Found {len(kpts)} keypoints: {kpts}")
+                                    if len(kpts) >= 3:
+                                        # Extract keypoint coordinates
+                                        kpt0 = (kpts[0][0], kpts[0][1]) if kpts[0][0] > 0 and kpts[0][1] > 0 else None
+                                        kpt1 = (kpts[1][0], kpts[1][1]) if kpts[1][0] > 0 and kpts[1][1] > 0 else None
+                                        kpt2 = (kpts[2][0], kpts[2][1]) if kpts[2][0] > 0 and kpts[2][1] > 0 else None
                                     
                                     if self.verbose:
                                         print(f"🔍 DEBUG: kpt0={kpt0}, kpt1={kpt1}, kpt2={kpt2}")
@@ -868,11 +1035,110 @@ class SimpleHeadPoseDetector:
                                     nose = kpt0       # First keypoint is nose
                                     ear_left = kpt1   # Second keypoint is left ear
                                     ear_right = kpt2  # Third keypoint is right ear
+                                
+                                final_bbox = (x1, y1, x2, y2)
+                                final_confidence = confidence
+                                is_tracked = False
+                                
+                                # Initialize or reinitialize optical flow tracking for high confidence detections
+                                if (self.optical_flow_tracker and 
+                                    self.optical_flow_tracker.should_reinitialize(confidence, self.config.optical_flow_confidence_threshold)):
+                                    
+                                    pose_data = {
+                                        'nose': nose,
+                                        'ear_left': ear_left,
+                                        'ear_right': ear_right,
+                                        'bbox': final_bbox,
+                                        'confidence': confidence
+                                    }
+                                    
+                                    try:
+                                        self.optical_flow_tracker.start_tracking(pose_data, self.current_frame_number)
+                                        if self.verbose:
+                                            print(f"🔄 Optical flow tracking (re)initialized with confidence {confidence:.3f}")
+                                    except Exception as e:
+                                        if self.verbose:
+                                            print(f"⚠️ Failed to initialize optical flow tracking: {e}")
                             
-                            # Draw with proper parameters
-                            frame = draw_head_pose(frame, (x1, y1, x2, y2), nose, ear_left, ear_right, confidence)
+                            # Calculate head angle if angle tracking is enabled
+                            angle, head_direction = None, None
+                            if self.config.enable_angle_tracking and nose and (ear_left or ear_right):
+                                angle, head_direction = calculate_head_angle_to_target(
+                                    nose, ear_left, ear_right,
+                                    self.config.target_line, 
+                                    self.target_line_position,
+                                    self.frame_width, self.frame_height
+                                )
+                                
+                                if angle is not None and self.angle_kalman:
+                                    # Apply Kalman filtering for smoother angle tracking
+                                    self.smoothed_angle = self.angle_kalman.update(angle)
+                                    self.current_angle = angle
+                                    self.head_direction = head_direction
+                                    
+                                    if self.verbose:
+                                        print(f"📐 Angle: {angle:.1f}° → {self.smoothed_angle:.1f}° (filtered)")
+                            
+                            # Draw with proper parameters (use final pose data)
+                            frame = draw_head_pose(frame, final_bbox, nose, ear_left, ear_right, final_confidence)
+                            
+                            # Add tracking status overlay if using optical flow
+                            if is_tracked and self.optical_flow_tracker:
+                                tracking_info = self.optical_flow_tracker.get_tracking_info()
+                                tracking_text = f"OF: {tracking_info['frames_since_detection']}f, Q:{tracked_pose.tracking_quality:.2f}"
+                                cv2.putText(frame, tracking_text, (10, 30), 
+                                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)  # Cyan for optical flow
+                                
+                                # Save optical flow tracked frame and label
+                                if (self.config.save_optical_flow_frames and self.run_dir and 
+                                    self.current_frame_number % self.config.save_every_n_optical_flow == 0):
+                                    try:
+                                        # Attach original YOLO info for metadata
+                                        try:
+                                            tracked_pose.original_confidence = confidence
+                                            tracked_pose.original_bbox = (x1, y1, x2, y2)
+                                        except Exception:
+                                            pass
+                                        frame_path, label_path = save_optical_flow_frame_and_label(
+                                            self.run_dir, frame, tracked_pose, self.current_frame_number, is_rescue=False
+                                        )
+                                        if self.verbose:
+                                            print(f"💾 Saved optical flow frame: {frame_path.name}")
+                                    except Exception as e:
+                                        if self.verbose:
+                                            print(f"⚠️ Failed to save optical flow frame: {e}")
+                            
+                            # Add angle overlay in top-right corner if enabled
+                            if self.config.enable_angle_tracking and self.config.show_angle_overlay and self.smoothed_angle is not None:
+                                angle_text = f"Angle: {self.smoothed_angle:.1f}`"
+                                # Position in top-right corner
+                                frame_height, frame_width = frame.shape[:2]
+                                text_size = cv2.getTextSize(angle_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                                text_x = frame_width - text_size[0] - 10
+                                text_y = 30
+                                cv2.putText(frame, angle_text, (text_x, text_y), 
+                                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                            
+                            # Draw head direction arrow in top-right corner if enabled
+                            if (self.config.enable_angle_tracking and self.config.show_head_direction_arrow 
+                                and nose and self.head_direction):
+                                # Position arrow in top-right corner, below angle text
+                                frame_height, frame_width = frame.shape[:2]
+                                arrow_center_x = frame_width - 60
+                                arrow_center_y = 70
+                                arrow_length = 40
+                                arrow_start = (arrow_center_x, arrow_center_y)
+                                arrow_end = (
+                                    int(arrow_center_x + self.head_direction[0] * arrow_length),
+                                    int(arrow_center_y + self.head_direction[1] * arrow_length)
+                                )
+                                cv2.arrowedLine(frame, arrow_start, arrow_end, 
+                                              (0, 255, 255), 3, tipLength=0.3)
+                            
                             if self.verbose:
                                 print(f"✅ Drew keypoints: nose={nose is not None}, ears={ear_left is not None and ear_right is not None}")
+                                if angle is not None:
+                                    print(f"📐 Head angle: {angle:.1f}° (smoothed: {self.smoothed_angle:.1f}°)")
                         else:
                             frame = self.draw_simple_detection(frame, results)
                             if self.verbose:
@@ -884,22 +1150,83 @@ class SimpleHeadPoseDetector:
                 else:
                     frame = self.draw_simple_detection(frame, results)
                 
-                # Add simple detection event occasionally
-                if self.detection_count % 30 == 1:  # Every ~2 seconds at 15fps
-                    self.add_behavioral_event("detection", f"Head detected (conf: {self.CONFIDENCE_THRESHOLD})")
+                # # Add simple detection event occasionally
+                # if self.detection_count % 30 == 1:  # Every ~2 seconds at 15fps
+                #     detection_msg = f"conf: >{self.CONFIDENCE_THRESHOLD:.2f}"
+                #     self.add_behavioral_event("detection", detection_msg)
+                #     self.last_detected = detection_msg
             
             else:
                 if self.verbose:
                     print(f"❌ Frame {self.current_frame_number}: No detections")
                 
-                # Handle no detection by displaying last detected behavioral event
+                # Try optical flow tracking even when YOLO has no detections
+                tracked_pose = None
+                if self.optical_flow_tracker:
+                    tracked_pose = self.optical_flow_tracker.track_pose(
+                        frame_number=self.current_frame_number,
+                        fallback_confidence=0.1  # Very low confidence for no-detection tracking
+                    )
+                    
+                    if tracked_pose is not None:
+                        if self.verbose:
+                            print(f"✅ Optical flow rescued frame (quality: {tracked_pose.tracking_quality:.3f})")
+                        
+                        # Draw tracked pose
+                        if DRAW_UTILS_AVAILABLE and tracked_pose.bbox:
+                            frame = draw_head_pose(frame, tracked_pose.bbox, 
+                                                 tracked_pose.nose, tracked_pose.ear_left, tracked_pose.ear_right, 
+                                                 tracked_pose.confidence)
+                            
+                            # Add tracking status overlay
+                            tracking_info = self.optical_flow_tracker.get_tracking_info()
+                            tracking_text = f"OF RESCUE: {tracking_info['frames_since_detection']}f, Q:{tracked_pose.tracking_quality:.2f}"
+                            cv2.putText(frame, tracking_text, (10, 30), 
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 165, 0), 1)  # Orange for rescue tracking
+                            
+                            # Save rescue tracked frame and label
+                            if (self.config.save_optical_flow_frames and self.run_dir and 
+                                self.current_frame_number % self.config.save_every_n_optical_flow == 0):
+                                try:
+                                    frame_path, label_path = save_optical_flow_frame_and_label(
+                                        self.run_dir, frame, tracked_pose, self.current_frame_number, is_rescue=True
+                                    )
+                                    if self.verbose:
+                                        print(f"💾 Saved rescue tracking frame: {frame_path.name}")
+                                except Exception as e:
+                                    if self.verbose:
+                                        print(f"⚠️ Failed to save rescue tracking frame: {e}")
+                            
+                            # Create fake results for behavioral analysis
+                            results = [type('obj', (object,), {
+                                'boxes': type('obj', (object,), {
+                                    'xyxy': [np.array([tracked_pose.bbox])],
+                                    'conf': [tracked_pose.confidence]
+                                })(),
+                                'keypoints': type('obj', (object,), {
+                                    'xy': [np.array([[
+                                        tracked_pose.nose or [0, 0],
+                                        tracked_pose.ear_left or [0, 0], 
+                                        tracked_pose.ear_right or [0, 0]
+                                    ]])]
+                                })() if tracked_pose.nose else None
+                            })()]
+                        
+                        return frame, results
+                
+                # No tracking possible - handle no detection by displaying last detected behavioral event
                 last_instruction = self.last_behavioral_instruction or self.last_detected
                 if last_instruction:
                     # Add overlay text showing last detected behavioral event
                     overlay_text = f"CONF < {self.CONFIDENCE_THRESHOLD:.2f} - Last: {last_instruction}"
-                    safe_overlay = overlay_text.replace("→", "->").replace("←", "<-")
+                    safe_overlay = overlay_text.replace("→", "->").replace("←", "<-").replace("—", "-").replace("–", "-")
                     cv2.putText(frame, safe_overlay, (10, frame.shape[0] - 50),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 255), 2)  # Blue color for low confidence
+                else:
+                    # No previous detections available
+                    overlay_text = f"CONF < {self.CONFIDENCE_THRESHOLD:.2f} - No previous detections"
+                    cv2.putText(frame, overlay_text, (10, frame.shape[0] - 50),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 255), 2)
             
             return frame, results
             
@@ -940,40 +1267,13 @@ class SimpleHeadPoseDetector:
                 if keypoints is not None and len(keypoints.xy) > 0:
                     kpts = keypoints.xy[0].cpu().numpy()
                     if len(kpts) >= 3:
-                        # Map keypoints: kpt0=nose, kpt1=ear_left, kpt2=ear_right
-                        if kpts[0][0] > 0 and kpts[0][1] > 0:
-                            nose = tuple(kpts[0])
-                        if kpts[1][0] > 0 and kpts[1][1] > 0:
-                            ear_left = tuple(kpts[1])
+                        # Map keypoints: kpt0=ear_left, kpt1=ear_right, kpt2=nose
                         if kpts[2][0] > 0 and kpts[2][1] > 0:
-                            ear_right = tuple(kpts[2])
-                
-                # Calculate head angle to target screen
-                if nose and (ear_left or ear_right):
-                    angle_result = calculate_head_angle_to_target(
-                        nose=nose,
-                        ear_left=ear_left,
-                        ear_right=ear_right,
-                        target_line=self.config.target_line,
-                        target_line_position=self.target_line_position,
-                        frame_width=self.frame_width,
-                        frame_height=self.frame_height
-                    )
-                    
-                    if angle_result[0] is not None:
-                        self.current_angle, self.head_direction = angle_result
-                        # Apply Kalman filtering for smooth angle tracking
-                        self.smoothed_angle = self.angle_kalman.update(self.current_angle)
-                        
-                        if self.verbose:
-                            angular_velocity = self.angle_kalman.get_angular_velocity()
-                            print(f"🧭 Angle to {self.config.target_line}: {self.current_angle:.1f}° → {self.smoothed_angle:.1f}° (vel: {angular_velocity:.2f}°/frame)")
-                    else:
-                        self.current_angle = None
-                        self.head_direction = None
-                else:
-                    self.current_angle = None
-                    self.head_direction = None
+                            nose = tuple(kpts[2])
+                        if kpts[0][0] > 0 and kpts[0][1] > 0:
+                            ear_left = tuple(kpts[0])
+                        if kpts[1][0] > 0 and kpts[1][1] > 0:
+                            ear_right = tuple(kpts[1])
                 
                 # Process with ADVANCED detector
                 if self.advanced_detector:
@@ -991,6 +1291,8 @@ class SimpleHeadPoseDetector:
                             instruction.phase,  # 'approaching', 'retreating', or 'resting'
                             instruction.instruction  # Full instruction string
                         )
+                        # Update last behavioral instruction for no-detection display
+                        self.last_behavioral_instruction = instruction.instruction
                         if self.verbose:
                             print(f"📍 {instruction.instruction}")
                 
@@ -1029,10 +1331,7 @@ class SimpleHeadPoseDetector:
                         'distance_from_edge': distance_from_edge,
                         'speed_px_per_frame': speed,
                         'event_type': event_type,
-                        'event_name': event_name,
-                        'head_angle_raw': self.current_angle if self.current_angle is not None else float('nan'),
-                        'head_angle_smoothed': self.smoothed_angle if self.smoothed_angle is not None else float('nan'),
-                        'angular_velocity': self.angle_kalman.get_angular_velocity() if self.angle_kalman.initialized else float('nan')
+                        'event_name': event_name
                     })
                         
         except Exception as e:
@@ -1107,7 +1406,6 @@ class SimpleHeadPoseDetector:
             self.last_event_overlay = overlay_text_ascii
             self.last_event_time = time.time()
             self.last_detected = overlay_text_ascii
-            self.last_behavioral_instruction = overlay_text_ascii  # Track meaningful instructions
         elif results:
             # Ensure periodic detection updates even without behavioral instructions
             if self.detection_count % 10 == 1:
@@ -1118,8 +1416,10 @@ class SimpleHeadPoseDetector:
                         primary_conf = float(first_result.boxes[0].conf[0])
                 except Exception:
                     primary_conf = None
-                conf_text = f"{primary_conf:.2f}" if primary_conf is not None else f"&lt;{self.CONFIDENCE_THRESHOLD:.2f}"
-                self.add_behavioral_event("detection", f"Head detected (conf: {conf_text})")
+                conf_text = f"{primary_conf:.2f}" if primary_conf is not None else f"< {self.CONFIDENCE_THRESHOLD:.2f}"
+                # detection_msg = f"conf: {conf_text}"
+                # self.add_behavioral_event("detection", detection_msg)
+                # self.last_detected = detection_msg
                 last_detection = self.last_detected
                 self.last_event_overlay = f"DETECTION: conf {conf_text}. Last detection: {last_detection}"
                 self.last_event_time = time.time()
@@ -1130,7 +1430,7 @@ class SimpleHeadPoseDetector:
             status_text = event_overlay
         else:
             # Fallback status when no behavioral events
-            status_text = f"Conf: <{self.CONFIDENCE_THRESHOLD:.2f}. Latest detection: {self.last_detected or 'None'}>"
+            status_text = f"MONITORING | Frame: {frame_index} | Conf: >{self.CONFIDENCE_THRESHOLD:.2f}"
         
         # Clean up text for display
         safe_overlay = status_text.replace("→", "->").replace("←", "<-")
@@ -1142,29 +1442,6 @@ class SimpleHeadPoseDetector:
         video_time = f"Video: {frame_index / fps_for_display:.1f}s"
         cv2.putText(frame_with_detection, timestamp, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         cv2.putText(frame_with_detection, video_time, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        
-        # Add angle information overlay in top-right corner
-        if self.smoothed_angle is not None:
-            angle_text = f"Angle to {self.config.target_line}: {self.smoothed_angle:.1f}`"
-            # Position in top-right corner
-            text_size = cv2.getTextSize(angle_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
-            text_x = frame_width - text_size[0] - 10
-            text_y = 30
-            cv2.putText(frame_with_detection, angle_text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)  # Cyan color
-            
-            # Draw angle direction indicator - arrow showing actual head direction in top-right corner
-            if hasattr(self, 'head_direction') and self.head_direction is not None:
-                # Draw arrow in top-right corner below angle text, showing actual head direction
-                arrow_center_x = frame_width - 60
-                arrow_center_y = 70
-                arrow_length = 30
-                arrow_start = (arrow_center_x, arrow_center_y)
-                arrow_start = (arrow_center_x, arrow_center_y)
-                arrow_end = (
-                    int(arrow_center_x + arrow_length * self.head_direction[0]),
-                    int(arrow_center_y + arrow_length * self.head_direction[1])
-                )
-                cv2.arrowedLine(frame_with_detection, arrow_start, arrow_end, (0, 255, 255), 2, tipLength=0.3)
         
         # Overlay real-time FPS metrics
         detection_fps = self._compute_fps(self.detection_time_log)
@@ -1196,6 +1473,7 @@ class SimpleHeadPoseDetector:
             return False
         
         self.running = True
+        self.video_completed = False  # Reset video completion flag
         self.fps = self.processing_target_fps  # maintain legacy attribute for target processing FPS
         self.frame_queue = queue.Queue(maxsize=self.config.frame_queue_size)
         self.capture_time_log.clear()
@@ -1203,7 +1481,6 @@ class SimpleHeadPoseDetector:
         self.stream_time_log.clear()
         self.last_event_overlay = None
         self.last_detected = None
-        self.last_behavioral_instruction = None
         self.last_event_time = 0.0
         self.latest_processed_frame = None
         self.latest_frame = None
@@ -1233,7 +1510,9 @@ class SimpleHeadPoseDetector:
                 ret, frame = self.cap.read()
                 if not ret:
                     print("📹 End of video reached")
+                    self.video_completed = True
                     self.running = False
+                    self.add_behavioral_event("system", "Video completed")
                     break
                 
                 clean_frame = frame.copy()
@@ -1295,7 +1574,31 @@ class SimpleHeadPoseDetector:
                     self._handle_detection_output(frame_index, clean_frame, frame_with_detection, results,
                                                    frame_width, frame_height, video_fps, detection_start)
             finally:
+                print("\n🔄 Finalizing outputs and cleaning up...")
                 self.cleanup_files()
+                
+                # Run performance analysis after cleanup
+                if self.run_dir:
+                    print(f"\n📊 Running performance analysis...")
+                    try:
+                        analysis_success = run_performance_analysis(self.run_dir, self.config)
+                        if analysis_success:
+                            print("✅ Performance analysis completed")
+                        else:
+                            print("⚠️ Performance analysis failed or was skipped")
+                    except Exception as e:
+                        print(f"❌ Error during performance analysis: {e}")
+                
+                # Store the final output directory for status reporting
+                if hasattr(self, 'run_dir') and self.run_dir:
+                    self.final_output_dir = str(self.run_dir)
+                    print(f"\n📁 Final output directory: {self.final_output_dir}")
+                else:
+                    self.final_output_dir = None
+                
+                # Ensure running state is properly set to False after all processing
+                self.running = False
+                print("🏁 All processing completed - detection fully stopped")
         
         # Start frame reader and detection threads
         self.frame_reader_thread = threading.Thread(target=frame_reader_loop, daemon=True, name="FrameReader")
@@ -1314,6 +1617,7 @@ class SimpleHeadPoseDetector:
             "video_path": self.video_path,
             "model_path": self.model_path,
             "confidence_threshold": self.CONFIDENCE_THRESHOLD,
+            "good_confidence_threshold": self.config.good_confidence_threshold,
             "fps": self.processing_target_fps,
             "capture_fps": self.capture_fps,
             "stream_fps": self.stream_target_fps,
@@ -1370,29 +1674,44 @@ class SimpleHeadPoseDetector:
                     conf=conf
                 )
                 
-                # Extract keypoints (nose=kpt0, ear_left=kpt1, ear_right=kpt2)
+                # Extract keypoints (nose=kpt2, ear_left=kpt0, ear_right=kpt1)
                 if keypoints is not None and len(keypoints.xy) > 0:
                     kpts = keypoints.xy[0].cpu().numpy()  # First detection keypoints
                     if len(kpts) >= 3:
                         # Extract keypoints with correct mapping
-                        kpt0 = kpts[0]  # nose
-                        kpt1 = kpts[1]  # ear_left  
-                        kpt2 = kpts[2]  # ear_right
+                        kpt0 = kpts[0]  # ear_left
+                        kpt1 = kpts[1]  # ear_right  
+                        kpt2 = kpts[2]  # nose
                         
-                        # Save nose position (kpt0) - THIS IS WHAT USER WANTS
-                        if kpt0[0] > 0 and kpt0[1] > 0:
-                            pose.nose = tuple(kpt0)
+                        # Save nose position (kpt2) - THIS IS WHAT USER WANTS
+                        if kpt2[0] > 0 and kpt2[1] > 0:
+                            pose.nose = tuple(kpt2)
                         
                         # Save ear positions
+                        if kpt0[0] > 0 and kpt0[1] > 0:
+                            pose.ear_left = tuple(kpt0)
                         if kpt1[0] > 0 and kpt1[1] > 0:
-                            pose.ear_left = tuple(kpt1)
-                        if kpt2[0] > 0 and kpt2[1] > 0:
-                            pose.ear_right = tuple(kpt2)
+                            pose.ear_right = tuple(kpt1)
+                
+                # Add angle information if available
+                if hasattr(self, 'current_angle') and self.current_angle is not None:
+                    pose.angle = self.current_angle
+                if hasattr(self, 'smoothed_angle') and self.smoothed_angle is not None:
+                    pose.smoothed_angle = self.smoothed_angle
+                if hasattr(self, 'head_direction') and self.head_direction is not None:
+                    pose.head_direction = self.head_direction
         
         # Log detection to CSV (includes nose x,y if available)
         obs = PoseObservation(frame_count, pose)
         self.csv_writer.writerow(obs.as_row())
         self.csv_file.flush()  # Ensure data is written
+        
+        # Save frames with no detection to frames_to_review (every N frames to avoid spam)
+        if pose is None and frame_count % self.save_every_n_frames == 0:
+            frame_name = f"frame{frame_count:08d}.jpg"
+            save_labeled_frame(self.run_dir / "frames_to_review" / "images" / frame_name, clean_frame)
+            if self.verbose:
+                print(f"📝 Saved no-detection frame: {frame_name}")
         
         # Save files if detection found
         if pose is not None:
@@ -1418,6 +1737,43 @@ class SimpleHeadPoseDetector:
                 save_labeled_frame(self.run_dir / "preview_frames" / frame_name, drawn_frame)
                 if self.verbose:
                     print(f"🖼️  Saved preview: {frame_name}")
+            
+            # Save frames based on confidence thresholds
+            self._save_confidence_based_frames(pose, clean_frame, frame_name, label_name, frame_width, frame_height)
+    
+    def _save_confidence_based_frames(self, pose, clean_frame, frame_name, label_name, frame_width, frame_height):
+        """Save frames to confidence-based directories"""
+        if not pose or not self.run_dir:
+            return
+        
+        conf = pose.conf
+        keypoints = [pose.ear_left, pose.ear_right, pose.nose]
+        
+        # Low confidence frames (< threshold) → frames_to_review
+        if conf < self.CONFIDENCE_THRESHOLD:
+            # Save image
+            save_labeled_frame(self.run_dir / "frames_to_review" / "images" / frame_name, clean_frame)
+            # Save label
+            save_yolo_label_txt(
+                self.run_dir / "frames_to_review" / "labels" / label_name,
+                0, pose.bbox_xyxy, frame_width, frame_height, conf,
+                keypoints=keypoints
+            )
+            if self.verbose:
+                print(f"📝 Saved low-conf frame (conf={conf:.3f}): {frame_name}")
+        
+        # High confidence frames (> good_conf threshold) → high_conf
+        elif conf > self.config.good_confidence_threshold:
+            # Save image
+            save_labeled_frame(self.run_dir / "high_conf" / "images" / frame_name, clean_frame)
+            # Save label
+            save_yolo_label_txt(
+                self.run_dir / "high_conf" / "labels" / label_name,
+                0, pose.bbox_xyxy, frame_width, frame_height, conf,
+                keypoints=keypoints
+            )
+            if self.verbose:
+                print(f"⭐ Saved high-conf frame (conf={conf:.3f}): {frame_name}")
     
     def save_metrics_snapshot(self, frame_number):
         """Save periodic snapshot of LiveMetrics"""
@@ -1456,12 +1812,23 @@ class SimpleHeadPoseDetector:
             self.csv_file.close()
             self.csv_file = None
         
-        # Close video writer
+        # Ensure video writer is properly closed and saved
         if self.video_writer is not None:
-            self.video_writer.release()
-            self.video_writer = None
-            if self.output_video_path:
-                print(f"🎬 Video with overlays saved to: {self.output_video_path}")
+            try:
+                self.video_writer.release()
+                self.video_writer = None
+                if self.output_video_path and os.path.exists(self.output_video_path):
+                    print(f"🎬 Video with overlays saved to: {self.output_video_path}")
+                    # Store video path for status reporting
+                    self.saved_video_path = self.output_video_path
+                else:
+                    print("⚠️ Video file was not created or is missing")
+                    self.saved_video_path = None
+            except Exception as e:
+                print(f"⚠️ Error releasing video writer: {e}")
+                self.saved_video_path = None
+        else:
+            self.saved_video_path = None
         
         # Save LiveMetrics summary
         if self.run_dir and self.live_metrics:
@@ -1507,7 +1874,7 @@ class SimpleHeadPoseDetector:
                 writer = csv.DictWriter(f, fieldnames=[
                     'frame', 'timestamp', 'elapsed_sec', 'head_x', 'head_y', 
                     'confidence', 'distance_from_edge', 'speed_px_per_frame', 
-                    'event_type', 'event_name', 'head_angle_raw', 'head_angle_smoothed', 'angular_velocity'
+                    'event_type', 'event_name'
                 ])
                 writer.writeheader()
                 writer.writerows(self.trajectory_log)
@@ -1548,8 +1915,14 @@ class SimpleHeadPoseDetector:
             print(f"📈 Interactive plot saved to: {plot_html}")
         
         if self.run_dir:
+            # Count confidence-based saves
+            frames_to_review_count = len(list((self.run_dir / "frames_to_review" / "images").glob("*.jpg"))) if (self.run_dir / "frames_to_review" / "images").exists() else 0
+            high_conf_count = len(list((self.run_dir / "high_conf" / "images").glob("*.jpg"))) if (self.run_dir / "high_conf" / "images").exists() else 0
+            
             print(f"\n✅ Processing complete!")
             print(f"📊 Total detections: {self.detection_count}")
+            print(f"📝 Frames to review (conf < {self.CONFIDENCE_THRESHOLD}): {frames_to_review_count}")
+            print(f"⭐ High confidence frames (conf > {self.config.good_confidence_threshold}): {high_conf_count}")
             print(f"📁 Results saved to: {self.run_dir}")
     
     def stop_detection(self):
@@ -1570,7 +1943,11 @@ class SimpleHeadPoseDetector:
         
         if self.cap:
             self.cap.release()
-        self.add_behavioral_event("system", "Detection stopped")
+        
+        self.add_behavioral_event("system", "Detection stopped - cleanup will complete in background")
+        
+        # Note: cleanup_files() and performance analysis will be called 
+        # by the detection_loop's finally block, so we don't duplicate it here
     
     def get_latest_frame(self):
         """Get the latest processed frame"""
@@ -1605,8 +1982,18 @@ class SimpleHeadPoseDetector:
         if stream_fps_measured <= 0 and self.stream_target_fps:
             stream_fps_measured = self.stream_target_fps
         
-        return {
+        # Determine output directory to display
+        output_dir_display = "Not started yet"
+        if hasattr(self, 'final_output_dir') and self.final_output_dir:
+            # Show final output directory if processing is complete
+            output_dir_display = self.final_output_dir
+        elif self.run_dir:
+            # Show current run directory if processing is ongoing
+            output_dir_display = str(self.run_dir.resolve())
+        
+        status = {
             "running": self.running,
+            "video_completed": self.video_completed,
             "device": device_info,
             "memory": memory_info,
             "fps": self.processing_target_fps,
@@ -1617,19 +2004,33 @@ class SimpleHeadPoseDetector:
             "detection_fps": detection_fps_measured,
             "stream_fps": stream_fps_measured,
             "confidence_threshold": self.CONFIDENCE_THRESHOLD,
-            "output_dir": str(self.run_dir.resolve()) if self.run_dir else "Not started yet",
+            "good_confidence_threshold": self.config.good_confidence_threshold,
+            "output_dir": output_dir_display,
             "predict_stream": self.use_predict_stream,
-            "current_angle": self.current_angle,
-            "smoothed_angle": self.smoothed_angle,
-            "target_line": self.config.target_line,
-            "target_line_position": self.target_line_position,
-            "angle_tracking_enabled": True
+            # Video output information
+            "saved_video_path": getattr(self, 'saved_video_path', None),
+            "final_output_dir": getattr(self, 'final_output_dir', None),
+            # Angle tracking information
+            "angle_tracking_enabled": self.config.enable_angle_tracking,
+            "target_line": self.config.target_line if self.config.enable_angle_tracking else None,
+            "current_angle": self.current_angle if self.config.enable_angle_tracking else None,
+            "smoothed_angle": self.smoothed_angle if self.config.enable_angle_tracking else None,
+            "show_angle_overlay": self.config.show_angle_overlay if self.config.enable_angle_tracking else False,
+            "show_direction_arrow": self.config.show_head_direction_arrow if self.config.enable_angle_tracking else False
         }
     
     def get_behavioral_events(self):
         """Get behavioral events (already ordered newest first)"""
         with self.events_lock:
             return self.behavioral_events.copy()
+    
+    def set_video_path(self, video_path):
+        """Update the video path (only when not running)"""
+        if not self.running:
+            self.video_path = video_path
+            self.video_completed = False
+            return True
+        return False
 
 # Flask App
 app = Flask(__name__)
@@ -1642,12 +2043,12 @@ log.setLevel(logging.ERROR)  # Only show errors, not every request
 # Global detector instance
 detector = None
 
-# HTML Template with improved UI
+# HTML Template with UI
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>🦎 FINAL Head Pose Detection</title>
+    <title>🦎 Head Pose Detection - Original Version</title>
     <style>
         body { 
             font-family: Arial, sans-serif; 
@@ -1679,6 +2080,16 @@ HTML_TEMPLATE = """
         .controls-section {
             flex: 1;
             min-width: 300px;
+        }
+        .video-selector {
+            background: #f0f8ff;
+            padding: 10px;
+            border-radius: 10px;
+            margin-bottom: 10px;
+        }
+        .video-selector h3 {
+            margin: 0 0 8px 0;
+            font-size: 1em;
         }
         .video-container {
             text-align: center;
@@ -1788,18 +2199,32 @@ HTML_TEMPLATE = """
 <body>
     <div class="container">
         <div class="header">
-            <h1>🦎 Head Pose Detection Interface</h1>
-            <p>Real-time lizard head pose tracking with behavioral analysis</p>
+            <h1>🦎 Head Pose Detection - Original Version</h1>
+            <p>Real-time lizard head pose tracking with behavioral analysis and angle measurement</p>
         </div>
         
         <div class="main-content">
             <div class="video-section">
                 <div class="video-container">
-                    <img id="video-stream" src="/video_feed" alt="Video Stream" style="width: 100%; max-width: 800px;">
+                    <img id="video-stream" src="/video_feed" alt="Video Stream" style="width: 100%; max-width: 800px; display: none;">
+                    <img id="video-preview" alt="Video Preview" style="width: 100%; max-width: 800px; display: block;">
+                    <div id="preview-info" style="color: #999; font-size: 0.9em; margin-top: 10px;">
+                        <span id="preview-text">Loading preview...</span>
+                    </div>
                 </div>
             </div>
             
             <div class="controls-section">
+                <div class="video-selector">
+                    <h3>📹 Video Selection</h3>
+                    <select id="video-select" onchange="selectVideo()" style="width: 100%; padding: 8px; margin-bottom: 10px; border: 1px solid #ddd; border-radius: 5px;">
+                        <option value="">Loading videos...</option>
+                    </select>
+                    <div id="video-info" style="font-size: 0.8em; color: #666; margin-bottom: 10px;">
+                        <span id="current-video">No video selected</span>
+                    </div>
+                </div>
+                
                 <div class="controls-status-row">
                     <div class="controls">
                         <h3>🎮 Controls</h3>
@@ -1828,6 +2253,134 @@ HTML_TEMPLATE = """
     <script>
         let isRunning = false;
         
+        // Initialize isRunning based on server state
+        function initializeRunningState() {
+            fetch('/api/status')
+            .then(response => response.json())
+            .then(data => {
+                isRunning = data.running || false;
+                console.log('Initialized isRunning state:', isRunning);
+                // Force immediate UI sync
+                updateStatus();
+            })
+            .catch(error => {
+                console.error('Error initializing running state:', error);
+                isRunning = false;
+            });
+        }
+        
+        function loadVideos() {
+            console.log('Loading videos...');
+            fetch('/api/videos')
+                .then(response => {
+                    console.log('Response status:', response.status);
+                    return response.json();
+                })
+                .then(data => {
+                    console.log('API response:', data);
+                    const select = document.getElementById('video-select');
+                    const currentVideoSpan = document.getElementById('current-video');
+                    
+                    // Clear existing options
+                    select.innerHTML = '';
+                    
+                    if (data.error) {
+                        select.innerHTML = '<option value="">Error loading videos</option>';
+                        currentVideoSpan.textContent = `Error: ${data.error}`;
+                        return;
+                    }
+                    
+                    if (data.videos.length === 0) {
+                        select.innerHTML = '<option value="">No videos found</option>';
+                        currentVideoSpan.textContent = `No videos in ${video_dir}`;
+                        return;
+                    }
+                    
+                    // Add videos to dropdown
+                    data.videos.forEach(video => {
+                        const option = document.createElement('option');
+                        option.value = video.path;
+                        option.textContent = `${video.name} (${(video.size / 1024 / 1024).toFixed(1)} MB)`;
+                        if (video.path === data.current) {
+                            option.selected = true;
+                        }
+                        select.appendChild(option);
+                    });
+                    
+                    // Update current video display
+                    const currentVideo = data.videos.find(v => v.path === data.current);
+                    if (currentVideo) {
+                        currentVideoSpan.textContent = `Current: ${currentVideo.name}`;
+                        // Load preview for current video
+                        loadPreview();
+                    } else {
+                        currentVideoSpan.textContent = 'No video selected';
+                    }
+                })
+                .catch(error => {
+                    console.error('Error loading videos:', error);
+                    const select = document.getElementById('video-select');
+                    const currentVideoSpan = document.getElementById('current-video');
+                    select.innerHTML = '<option value="">Error loading videos</option>';
+                    currentVideoSpan.textContent = `Error: ${error.message}`;
+                });
+        }
+        
+        function selectVideo() {
+            const select = document.getElementById('video-select');
+            const videoPath = select.value;
+            
+            if (!videoPath) return;
+            
+            fetch('/api/set_video', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({video_path: videoPath})
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    const currentVideoSpan = document.getElementById('current-video');
+                    const videoName = videoPath.split('/').pop();
+                    currentVideoSpan.textContent = `Current: ${videoName}`;
+                    console.log(data.message);
+                    // Update preview when video changes
+                    loadPreview();
+                } else {
+                    alert(`Error: ${data.message}`);
+                    loadVideos(); // Reload to reset selection
+                }
+            })
+            .catch(error => {
+                console.error('Error setting video:', error);
+                loadVideos(); // Reload to reset selection
+            });
+        }
+        
+        function loadPreview() {
+            const previewImg = document.getElementById('video-preview');
+            const previewText = document.getElementById('preview-text');
+            
+            previewText.textContent = 'Loading preview...';
+            
+            fetch('/api/preview_frame')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        previewImg.src = data.image;
+                        previewText.textContent = `Preview: ${data.video_info.name} (${data.video_info.dimensions})`;
+                    } else {
+                        previewImg.src = '';
+                        previewText.textContent = `Preview error: ${data.message}`;
+                    }
+                })
+                .catch(error => {
+                    console.error('Error loading preview:', error);
+                    previewImg.src = '';
+                    previewText.textContent = 'Error loading preview';
+                });
+        }
+        
         function startDetection() {
             fetch('/api/start', {method: 'POST'})
                 .then(response => response.json())
@@ -1836,7 +2389,13 @@ HTML_TEMPLATE = """
                         isRunning = true;
                         document.getElementById('start-btn').disabled = true;
                         document.getElementById('stop-btn').disabled = false;
+                        // Switch from preview to live stream
+                        document.getElementById('video-preview').style.display = 'none';
+                        document.getElementById('video-stream').style.display = 'block';
+                        document.getElementById('preview-text').textContent = 'Live detection running...';
                         updateStatus();
+                    } else {
+                        alert(`Error starting detection: ${data.message}`);
                     }
                 });
         }
@@ -1849,15 +2408,18 @@ HTML_TEMPLATE = """
                         isRunning = false;
                         document.getElementById('start-btn').disabled = false;
                         document.getElementById('stop-btn').disabled = true;
+                        // Switch back to preview
+                        document.getElementById('video-stream').style.display = 'none';
+                        document.getElementById('video-preview').style.display = 'block';
+                        loadPreview();
                         updateStatus();
                     }
                 });
         }
-        
         function updateStatus() {
             fetch('/api/status')
-                .then(response => response.json())
-                .then(data => {
+            .then(response => response.json())
+            .then(data => {
                     const statusDiv = document.getElementById('status-info');
                     if (data.running) {
                         const outputDir = data.output_dir || 'Not started yet';
@@ -1868,12 +2430,20 @@ HTML_TEMPLATE = """
                         const detectFps = Number(data.detection_fps || 0).toFixed(1);
                         const streamFps = Number(data.stream_fps || 0).toFixed(1);
                         
-                        // Angle information
-                        const currentAngle = data.current_angle !== null ? Number(data.current_angle).toFixed(1) : 'N/A';
-                        const smoothedAngle = data.smoothed_angle !== null ? Number(data.smoothed_angle).toFixed(1) : 'N/A';
-                        const targetLine = data.target_line || 'N/A';
-                        
                         // Create inline status layout
+                        let angleInfo = '';
+                        if (data.angle_tracking_enabled) {
+                            const currentAngle = data.current_angle ? data.current_angle.toFixed(1) : 'N/A';
+                            const smoothedAngle = data.smoothed_angle ? data.smoothed_angle.toFixed(1) : 'N/A';
+                            angleInfo = `
+                                <div style="display: flex; flex-direction: column; gap: 4px;">
+                                    <span>📐 Target: ${data.target_line || 'N/A'}</span>
+                                    <span>🎯 Angle: ${currentAngle}° → ${smoothedAngle}° (filtered)</span>
+                                    <span>📊 Overlays: ${data.show_angle_overlay ? '✅' : '❌'} angle, ${data.show_direction_arrow ? '✅' : '❌'} arrow</span>
+                                </div>
+                            `;
+                        }
+                        
                         statusDiv.innerHTML = `
                             <div style="display: flex; flex-wrap: wrap; gap: 12px; line-height: 1.6; align-items: center;">
                                 <span>✅ <strong>RUNNING</strong></span>
@@ -1885,13 +2455,9 @@ HTML_TEMPLATE = """
                                     <span>🎞️ Source video: ${sourceFps} fps</span>
                                     <span>🎥 Capture: ${captureFps} | 🧠 Detect: ${detectFps} | 📺 Stream: ${streamFps}</span>
                                 </div>
+                                ${angleInfo}
                                 <span>🔍 Conf: ${data.confidence_threshold}</span>
                                 <span>🛰️ YOLO stream: ${data.predict_stream ? 'ON' : 'OFF'}</span>
-                                <div style="display: flex; flex-direction: column; gap: 4px; padding: 8px; background: #f0f8ff; border-radius: 4px;">
-                                    <span>🧭 <strong>Head Angle Tracking</strong></span>
-                                    <span>📍 Target: ${targetLine} edge</span>
-                                    <span>📐 Current: ${currentAngle}° | Smoothed: ${smoothedAngle}°</span>
-                                </div>
                             </div>
                             <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #ddd;">
                                 <div style="font-size: 0.85em; color: #666;">
@@ -1904,10 +2470,65 @@ HTML_TEMPLATE = """
                             </div>
                         `;
                     } else {
-                        statusDiv.innerHTML = '<p>⏸️ Status: <strong>STOPPED</strong></p>';
+                        // Handle stopped or completed state
+                        let statusText = '⏸️ Status: <strong>STOPPED</strong>';
+                        if (data.video_completed) {
+                            statusText = '✅ Status: <strong>VIDEO COMPLETED</strong>';
+                        }
+                        
+                        // Show final output information if available
+                        let outputInfo = '';
+                        if (data.final_output_dir || data.output_dir !== 'Not started yet') {
+                            const finalDir = data.final_output_dir || data.output_dir;
+                            outputInfo = `
+                                <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #ddd;">
+                                    <div style="font-size: 0.85em; color: #666;">
+                                        <strong>📁 Final Output Directory:</strong><br>
+                                        <a href="file://${outputDir}" style="color: #4CAF50; text-decoration: none; word-break: break-all; font-size: 0.8em;">${finalDir}</a>
+                                    </div>
+                                    <div style="font-size: 0.75em; color: #999; margin-top: 5px;">
+                                        Files: detections.csv, trajectory.csv, behavioral_events.csv, nose_heading_map.html, analysis_plots/
+                                    </div>
+                                    ${data.saved_video_path ? `
+                                        <div style="font-size: 0.8em; color: #666; margin-top: 5px;">
+                                            <strong>🎬 Saved Video:</strong><br>
+                                            <a href="file://${data.saved_video_path}" style="color: #4CAF50; text-decoration: none; word-break: break-all; font-size: 0.75em;">${data.saved_video_path}</a>
+                                        </div>
+                                    ` : ''}
+                                </div>
+                            `;
+                        }
+                        
+                        statusDiv.innerHTML = `<p>${statusText}</p>${outputInfo}`;
                     }
-                });
-        }
+                    
+                    // Update button states based on server running status (always sync with server)
+                    if (data.running && !isRunning) {
+                        // Server says running but client doesn't think so - sync up
+                        console.log('Syncing: Server running, client stopped - enabling detection mode');
+                        isRunning = true;
+                        document.getElementById('start-btn').disabled = true;
+                        document.getElementById('stop-btn').disabled = false;
+                    } else if (!data.running && isRunning) {
+                        // Server says stopped but client thinks it's running - sync up
+                        console.log('Syncing: Server stopped, client running - disabling detection mode');
+                        isRunning = false;
+                        document.getElementById('start-btn').disabled = false;
+                        document.getElementById('stop-btn').disabled = true;
+                        // Switch back to preview
+                        document.getElementById('video-stream').style.display = 'none';
+                        document.getElementById('video-preview').style.display = 'block';
+                        loadPreview();
+                    } else if (!data.running && !isRunning) {
+                        // Both agree it's stopped - make sure buttons are in correct state
+                        document.getElementById('start-btn').disabled = false;
+                        document.getElementById('stop-btn').disabled = true;
+                        // Ensure we're showing preview mode
+                        document.getElementById('video-stream').style.display = 'none';
+                        document.getElementById('video-preview').style.display = 'block';
+                    }
+        });
+    }
         
         let previousEventCount = 0;
         
@@ -1946,15 +2567,19 @@ HTML_TEMPLATE = """
         
         // Auto-update status and events
         setInterval(() => {
+            // Always update status to catch when backend stops
+            updateStatus();
+            // Only update events when running (events only happen during detection)
             if (isRunning) {
-                updateStatus();
                 updateEvents();
             }
         }, 1000);
         
-        // Initial update
-        updateStatus();
-        updateEvents();
+        // Initial update - initialize running state first
+        initializeRunningState();
+        updateEvents();  
+        loadVideos();
+        // Don't load preview immediately - wait for video selection
     </script>
 </body>
 </html>
@@ -2044,9 +2669,121 @@ def get_events():
         return jsonify(detector.get_behavioral_events())
     return jsonify([])
 
+@app.route('/api/videos')
+def get_videos():
+    """Get list of available videos from the video directory"""
+    try:
+        video_dir = CONFIG.video_dir
+        if not os.path.exists(video_dir):
+            return jsonify({"videos": [], "error": f"Video directory not found: {video_dir}"})
+        
+        video_extensions = ('.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm')
+        videos = []
+        
+        for filename in os.listdir(video_dir):
+            if filename.lower().endswith(video_extensions):
+                video_path = os.path.join(video_dir, filename)
+                videos.append({
+                    "name": filename,
+                    "path": video_path,
+                    "size": os.path.getsize(video_path) if os.path.exists(video_path) else 0
+                })
+        
+        # Sort by name
+        videos.sort(key=lambda x: x['name'])
+        
+        # Get current video
+        current_video = CONFIG.video_path if detector is None else detector.video_path
+        
+        return jsonify({
+            "videos": videos,
+            "current": current_video,
+            "video_dir": video_dir
+        })
+    except Exception as e:
+        return jsonify({"videos": [], "error": str(e)})
+
+@app.route('/api/set_video', methods=['POST'])
+def set_video():
+    """Set the video path for the next detection run"""
+    global detector
+    try:
+        data = request.get_json()
+        video_path = data.get('video_path')
+        
+        if not video_path:
+            return jsonify({"success": False, "message": "No video path provided"})
+        
+        if not os.path.exists(video_path):
+            return jsonify({"success": False, "message": f"Video file not found: {video_path}"})
+        
+        if detector and detector.running:
+            return jsonify({"success": False, "message": "Cannot change video while detection is running"})
+        
+        # Update global config
+        CONFIG.video_path = video_path
+        
+        # Update detector if it exists
+        if detector:
+            detector.set_video_path(video_path)
+        
+        return jsonify({"success": True, "message": f"Video set to: {os.path.basename(video_path)}"})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)})
+
+@app.route('/api/preview_frame')
+def get_preview_frame():
+    """Get the first frame of the current video as a preview"""
+    try:
+        video_path = CONFIG.video_path if detector is None else detector.video_path
+        
+        if not video_path or not os.path.exists(video_path):
+            return jsonify({"success": False, "message": "No valid video selected"})
+        
+        # Open video and get first frame
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return jsonify({"success": False, "message": "Cannot open video file"})
+        
+        ret, frame = cap.read()
+        cap.release()
+        
+        if not ret:
+            return jsonify({"success": False, "message": "Cannot read first frame"})
+        
+        # Resize frame for preview (max width 800px)
+        height, width = frame.shape[:2]
+        if width > 800:
+            scale = 800.0 / width
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
+        
+        # Encode frame as JPEG
+        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not ret:
+            return jsonify({"success": False, "message": "Cannot encode frame"})
+        
+        # Return as base64 encoded image
+        import base64
+        frame_base64 = base64.b64encode(buffer).decode('utf-8')
+        
+        return jsonify({
+            "success": True, 
+            "image": f"data:image/jpeg;base64,{frame_base64}",
+            "video_info": {
+                "path": video_path,
+                "name": os.path.basename(video_path),
+                "dimensions": f"{width}x{height}"
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)})
+
 if __name__ == '__main__':
     print("✅ All imports successful")
-    print("🚀 Starting FINAL Head Pose Detection UI")
+    print("🚀 Starting Head Pose Detection UI - Original Version (Regular YOLO)")
     
     # Print current configuration
     CONFIG.print_config()

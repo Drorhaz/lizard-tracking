@@ -8,13 +8,12 @@ dataset/
 *.pt
 
 
-output/*
+# output/*
 !output/models/
 !output/compare/
-!output/detections/top_20250916T150021-20251001T004728
+
 *backup*
-!/a/home/cc/students/neurosci/bareketd1/sandbox/lizard-tracking/output/models/enhanced_pose
-!output/detections/top_20250916T150021-20251010T044014
+
 
 *.env
 */config/.env
